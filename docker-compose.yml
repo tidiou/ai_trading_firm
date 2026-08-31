@@ -1,0 +1,29 @@
+# Local Postgres for MBY-Trading development.
+# Run: docker compose up -d
+# Stop: docker compose down          (data persists in the named volume)
+# Wipe: docker compose down -v       (deletes all data — careful)
+#
+# `name:` is pinned deliberately — without it, Compose names the
+# project (and therefore the volume) after the containing folder,
+# so re-downloading this project into a differently-named folder
+# (e.g. "ai_trading_firm 5") silently creates a brand-new, empty
+# volume instead of reusing the one you already set up.
+
+name: mby-trading
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: mby-trading-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mby
+      POSTGRES_PASSWORD: mby_dev_password
+      POSTGRES_DB: mby_trading
+    ports:
+      - "5433:5432"
+    volumes:
+      - mby_trading_pgdata:/var/lib/postgresql/data
+
+volumes:
+  mby_trading_pgdata:

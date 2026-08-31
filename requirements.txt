@@ -1,0 +1,9 @@
+anthropic
+alpaca-py
+requests
+sqlalchemy
+psycopg2-binary
+python-dotenv
+pydantic
+pandas-market-calendars
+apscheduler
