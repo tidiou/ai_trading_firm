@@ -75,36 +75,36 @@ def get_index_quotes() -> list[dict]:
     The stable /quote endpoint takes one symbol at a time, so this
     loops rather than batching — fine at 4 calls, and simpler than
     debugging an unconfirmed batch-endpoint parameter name.
+
+    Routes through the shared _get() helper (same as every other
+    function below) — this was NOT true earlier: this function
+    predates _get()'s retry-with-backoff logic and was still making
+    a raw, unprotected request, so it had no retry/backoff on a 429
+    while every function built after it did. Fixed here.
     """
     results = []
     for symbol in MACRO_QUOTE_SYMBOLS:
-        url = f"{FMP_BASE_URL}/quote"
-        resp = requests.get(url, params={"symbol": symbol, "apikey": FMP_API_KEY}, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        # FMP returns a list even for a single symbol — normalize either way.
+        data = _get("quote", {"symbol": symbol})
+        if isinstance(data, dict) and "error" in data:
+            continue  # plan/paywall issue for this symbol — skip, don't crash the whole call
         results.extend(data if isinstance(data, list) else [data])
     return results
 
 
 def get_economic_calendar(from_date: str, to_date: str) -> list[dict]:
-    """Scheduled macro releases (Fed, CPI, jobs, etc.) in a date range."""
-    url = f"{FMP_BASE_URL}/economic-calendar"
-    resp = requests.get(
-        url, params={"from": from_date, "to": to_date, "apikey": FMP_API_KEY}, timeout=15
-    )
-    resp.raise_for_status()
-    return resp.json()
+    """Scheduled macro releases (Fed, CPI, jobs, etc.) in a date range.
+    Currently unused (dropped from Atlas's toolset — paid FMP tier
+    only) but fixed to route through _get() for when it's reinstated."""
+    return _get("economic-calendar", {"from": from_date, "to": to_date})
 
 
 def get_macro_news(query: str, limit: int = 10) -> list[dict]:
-    """General financial news, filtered client-side by a keyword."""
-    url = f"{FMP_BASE_URL}/news/general-latest"
-    resp = requests.get(
-        url, params={"page": 0, "limit": 50, "apikey": FMP_API_KEY}, timeout=15
-    )
-    resp.raise_for_status()
-    articles = resp.json()
+    """General financial news, filtered client-side by a keyword.
+    Currently unused (dropped from Atlas's toolset — paid FMP tier
+    only) but fixed to route through _get() for when it's reinstated."""
+    articles = _get("news/general-latest", {"page": 0, "limit": 50})
+    if isinstance(articles, dict) and "error" in articles:
+        return []
     query_lower = query.lower()
     matches = [a for a in articles if query_lower in a.get("title", "").lower()
                or query_lower in a.get("text", "").lower()]

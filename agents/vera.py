@@ -309,6 +309,12 @@ def run(today: date, atlas_output: dict) -> dict:
             )
             session.execute(stmt)
 
+        # Delete today's prior candidates before reinserting — a
+        # same-day rerun should REPLACE today's screening results,
+        # not accumulate tickers across multiple runs (the earlier
+        # per-row upsert let stale candidates from an earlier run
+        # linger even if a later rerun didn't surface them again).
+        session.query(NewCandidate).filter(NewCandidate.candidate_date == today).delete()
         for c in candidate_results:
             stmt = pg_insert(NewCandidate).values(
                 candidate_date=today,

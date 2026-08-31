@@ -7,3 +7,5 @@ python-dotenv
 pydantic
 pandas-market-calendars
 apscheduler
+streamlit
+pandas
