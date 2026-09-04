@@ -52,6 +52,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from agents.nora import is_circuit_breaker_active
 from core.clients.claude_client import run_agent_loop, extract_json
 from core.db import session_scope
 from core.models import (
@@ -69,7 +70,35 @@ MIN_CASH_RESERVE_PCT = 5.0
 # adjusts from. Conviction 1-2 shouldn't reach Marcus at all (Solomon
 # requires >=4 for new_position), the 3-tier exists as a defensive
 # fallback, not an expected path.
+#
+# The multiplier scales the NEW RISK ADDED (Nora's headroom), not the
+# resulting total weight — so topping up a conviction-4 name takes 70%
+# of the room remaining, not 70% of the limit.
 CONVICTION_SIZE_TIERS = {5: 1.0, 4: 0.7, 3: 0.4}
+
+# =================================================================
+# UNITS — read this before touching any sizing arithmetic.
+#
+#   Nora's max_size_pct   = HEADROOM. The ADDITIONAL portfolio weight
+#                           this trade may take, already net of what
+#                           is held, and already the tighter of the
+#                           position and sector limits.
+#
+#   Marcus's target_size_pct = the RESULTING TOTAL portfolio weight
+#                           for that name after the trade completes.
+#
+# These two used to be conflated, and it was not a rounding error. An
+# `add` on a name already at 7% received a ceiling of the full 8%
+# limit; Marcus sized 8 x 0.7 = 5.6%; Ada then bought 5.6% of NAV of
+# NEW stock on top of the 7% already held, landing at ~12.6% — with
+# Nora, Marcus and Clara all recording the trade as within limits,
+# because not one of them looked at the portfolio the trade RESULTED
+# in.
+#
+# So: Nora hands over room, Marcus decides where inside that room to
+# land, and Ada converges on it. Anyone changing these units has to
+# change all three.
+# =================================================================
 
 
 # =================================================================
@@ -157,6 +186,17 @@ def run(today: date) -> dict:
     guardrails (at-risk block, ceiling clamp), optionally lets Claude
     adjust within those bounds, then persists final allocations.
     """
+    # Read before opening the session below, not inside it: this does
+    # its own DB read, and nesting session_scope() would hold two
+    # connections from a pool sized for a once-daily batch job.
+    #
+    # DEFENCE IN DEPTH. Nora already rejects new_position/add at the
+    # authoritative decision point while the breaker is active, so
+    # nothing frozen should reach here — but a stale ProposalReview row
+    # from an earlier same-day run could, and Marcus must not be the
+    # reason a frozen book grows. Reductions stay permitted.
+    breaker_active = is_circuit_breaker_active(today)
+
     with session_scope() as session:
         approved = (
             session.query(ProposalReview, Proposal)
@@ -176,13 +216,32 @@ def run(today: date) -> dict:
         # -------------------------------------------------------
         base_allocations = []
         for review, proposal in approved:
+            if breaker_active and proposal.action in ("new_position", "add"):
+                base_allocations.append({
+                    "ticker": proposal.ticker, "action": proposal.action,
+                    "base_size_pct": 0.0, "ceiling_pct": 0.0,
+                    "existing_pct": 0.0, "headroom_pct": 0.0,
+                    "conviction": None,
+                    "blocked_reason": (
+                        "Blocked: portfolio drawdown circuit breaker is ACTIVE — "
+                        "no new positions or adds while frozen (code-enforced)."
+                    ),
+                })
+                continue
+
             if proposal.action in ("exit", "trim"):
-                existing_weight = float(current_positions[proposal.ticker].weight_pct) \
+                # `or 0` matters: weight_pct is nullable, and float(None)
+                # raises. A position Otis wrote before equity was known
+                # would have taken the whole cycle down here.
+                existing_weight = (
+                    float(current_positions[proposal.ticker].weight_pct or 0)
                     if proposal.ticker in current_positions else 0.0
+                )
                 target = 0.0 if proposal.action == "exit" else round(existing_weight * 0.5, 2)
                 base_allocations.append({
                     "ticker": proposal.ticker, "action": proposal.action,
                     "base_size_pct": target, "ceiling_pct": None,
+                    "existing_pct": existing_weight, "headroom_pct": None,
                     "conviction": None, "blocked_reason": None,
                 })
                 continue
@@ -196,19 +255,32 @@ def run(today: date) -> dict:
                 # Manual states this rule.
                 base_allocations.append({
                     "ticker": proposal.ticker, "action": proposal.action,
-                    "base_size_pct": 0.0, "ceiling_pct": review.max_size_pct,
+                    "base_size_pct": 0.0, "ceiling_pct": float(review.max_size_pct or 0),
+                    "existing_pct": 0.0, "headroom_pct": 0.0,
                     "conviction": None,
                     "blocked_reason": "Blocked: cannot increase size on an at_risk position (code-enforced).",
                 })
                 continue
 
             conviction = _get_conviction_for_ticker(session, today, proposal.ticker)
-            ceiling = float(review.max_size_pct or 0)
+
+            # headroom = additional weight Nora allows; existing = what
+            # we already hold. The cap on the RESULTING weight is their
+            # sum, and that is what gets handed downstream as the ceiling.
+            headroom = float(review.max_size_pct or 0)
+            existing_weight = (
+                float(current_positions[proposal.ticker].weight_pct or 0)
+                if proposal.ticker in current_positions else 0.0
+            )
+            ceiling = round(existing_weight + headroom, 2)
+
             multiplier = CONVICTION_SIZE_TIERS.get(conviction, 0.0)
-            base_size = round(ceiling * multiplier, 2)
+            base_size = round(existing_weight + headroom * multiplier, 2)
+
             base_allocations.append({
                 "ticker": proposal.ticker, "action": proposal.action,
                 "base_size_pct": base_size, "ceiling_pct": ceiling,
+                "existing_pct": existing_weight, "headroom_pct": headroom,
                 "conviction": conviction, "blocked_reason": None,
             })
 
@@ -224,7 +296,10 @@ def run(today: date) -> dict:
             or "Portfolio is currently empty."
         )
         proposals_summary = "\n".join(
-            f"{a['ticker']}: starting size {a['base_size_pct']}%, ceiling {a['ceiling_pct']}%, conviction {a['conviction']}/5"
+            f"{a['ticker']}: currently held at {a['existing_pct']}%, "
+            f"starting TOTAL target {a['base_size_pct']}%, "
+            f"hard ceiling {a['ceiling_pct']}% total "
+            f"({a['headroom_pct']}% of new room), conviction {a['conviction']}/5"
             for a in adjustable
         )
         user_prompt = (
@@ -267,11 +342,20 @@ def run(today: date) -> dict:
 
         adj = adjustments_by_ticker.get(a["ticker"])
         claude_size = adj.adjusted_size_pct if adj else a["base_size_pct"]
-        clamped = max(0.0, min(claude_size, a["ceiling_pct"]))  # THE hard clamp
+        # THE hard clamp, now on the RESULTING total weight. Upper bound
+        # is existing + Nora's headroom; lower bound is what we already
+        # hold, because an `add` that came back smaller than the current
+        # position would be a trim, and trimming is not Marcus's call to
+        # make inside an add.
+        clamped = max(a["existing_pct"], min(claude_size, a["ceiling_pct"]))
         final_allocations.append({
             "ticker": a["ticker"], "action": a["action"], "target_size_pct": round(clamped, 2),
             "conviction_input": a["conviction"],
-            "rationale": adj.rationale if adj else f"Base conviction-tier size, ceiling {a['ceiling_pct']}%.",
+            "rationale": adj.rationale if adj else (
+                f"Base conviction-tier size; total target {a['base_size_pct']}% "
+                f"against a {a['ceiling_pct']}% ceiling "
+                f"({a['existing_pct']}% held + {a['headroom_pct']}% headroom)."
+            ),
             "priority": adj.priority if adj else 1,
         })
 

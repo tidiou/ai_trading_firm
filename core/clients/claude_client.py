@@ -28,7 +28,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+# The Anthropic SDK has NO default timeout unless one is set here —
+# without this, a stalled/hung request (bad network, an unusual API
+# stall) blocks forever with no error, no retry, nothing. This is
+# what actually happened during real testing: orchestrator.py sat
+# silently for 10+ minutes with no output and wouldn't even respond
+# to Ctrl+C cleanly. 90s is generous enough for a normal multi-tool-
+# call reasoning pass, but bounded — a real hang now fails loudly
+# instead of hanging indefinitely.
+API_TIMEOUT_SECONDS = 90.0
+
+client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=API_TIMEOUT_SECONDS)
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 MAX_TOOL_ITERATIONS = 12  # raised from Atlas's original 6 — Vera may check 2 tools across many tickers

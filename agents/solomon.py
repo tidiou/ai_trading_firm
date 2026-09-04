@@ -84,6 +84,15 @@ Hard rules — these are not suggestions:
 - A "trim" or "exit" proposal on a held position requires Vera's
   status to be "at_risk" WITH a newly named deteriorating trigger, or
   "broken". A position sitting at "at_risk" with no new information
+- An "exit" recommendation from Vera's undocumented-position review
+  IS a valid escalation trigger on its own — a position that entered
+  the book without ever going through proper research deserves prompt
+  attention regardless of whether anything new has "changed" about it,
+  since nothing was ever documented to change FROM.
+- A "profit_target_sustained" trigger IS a valid trim escalation on
+  its own — Vera only assigns this trigger when the trailing week's
+  data shows a genuinely sustained gain, not a single-day spike, so
+  it doesn't need a separate catalyst the way a new position would.
   since a prior day is NOT sufficient on its own to act.
 - A "new_position" proposal requires a candidate with conviction
   score of 4 or 5 AND a specific, named catalyst — not just "looks
@@ -186,6 +195,13 @@ POSITION MONITORING (from Vera):
 NEW CANDIDATES (from Vera):
 {vera_output.get('candidates') or 'No new candidates surfaced today.'}
 
+UNDOCUMENTED POSITION REVIEWS (from Vera — positions held with no
+prior thesis, freshly assessed today; an "exit" recommendation here
+is a valid escalation trigger even though it didn't go through the
+normal candidate pipeline; "adopt" recommendations are already
+documented and need no action from you):
+{vera_output.get('orphan_reviews') or 'None — no undocumented positions currently held.'}
+
 CURRENT PORTFOLIO:
 {portfolio_summary}
 
@@ -255,13 +271,14 @@ Decide whether anything clears the bar for escalation today."""
 
 if __name__ == "__main__":
     # Manual smoke test: python -m agents.solomon
-    # Chains Atlas -> Vera -> Solomon, mirroring the real daily cycle.
-    from agents import atlas, vera
+    # Reuses today's Atlas/Vera output if it already exists, instead
+    # of re-burning FMP calls testing a downstream agent — see
+    # core/dev_helpers.py for why. The real orchestrator.py always
+    # runs Atlas/Vera fresh; this shortcut is testing-only.
+    from core.dev_helpers import get_or_run_atlas, get_or_run_vera
 
-    print("Running Atlas...")
-    atlas_result = atlas.run(date.today())
-    print("Running Vera...")
-    vera_result = vera.run(date.today(), atlas_result)
+    atlas_result = get_or_run_atlas(date.today())
+    vera_result = get_or_run_vera(date.today(), atlas_result)
     print("Running Solomon...\n")
 
     result = run(date.today(), atlas_result, vera_result)

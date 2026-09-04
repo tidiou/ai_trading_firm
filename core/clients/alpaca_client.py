@@ -56,6 +56,25 @@ def get_account() -> dict:
     }
 
 
+def get_buying_power() -> float:
+    """
+    Settled cash available to trade with, right now.
+
+    Deliberately separate from get_account() rather than a field on it.
+    Buying power is one of the few genuinely live broker facts — under
+    T+1 settlement it diverges from equity whenever a sale has not
+    settled — whereas NAV and holdings come from Otis's ledger
+    (Operating Manual §4, core/ledger.py).
+
+    get_account() hands back equity alongside buying power, so calling
+    it for one puts the other within arm's reach, which is precisely
+    the ambiguity that let Ada size off a live broker call while Nora
+    enforced limits against the ledger. A function that can only return
+    the one fact cannot be misused for the other.
+    """
+    return float(get_account()["buying_power"])
+
+
 def get_order_by_id(order_id: str) -> dict:
     """Current status/fill details for a previously-submitted order —
     used by Otis to reconcile what was submitted against what
@@ -127,6 +146,30 @@ def get_latest_quote(ticker: str) -> dict:
         "bid": bid, "ask": ask, "mid": mid,
         "spread_pct": round(spread_pct, 3), "used_fallback_trade_price": False,
     }
+
+
+def cancel_order(order_id: str) -> dict:
+    """
+    Cancels an order that has not filled.
+
+    Needed for the end-of-day sweep (Operating Manual §7.7). Every order
+    this desk places is TimeInForce.DAY, so an unfilled one expires on
+    its own overnight — but "expired on its own" and "we cancelled it
+    deliberately" are different facts, and only one of them is a
+    decision on the record.
+
+    Alpaca rejects a cancel on an order that has already reached a
+    terminal state, which is a race we can lose legitimately: it may
+    have filled between the status check and this call. That is not an
+    error worth failing a reconciliation over, so it is caught and
+    reported rather than raised — the subsequent status read is what
+    settles what actually happened.
+    """
+    try:
+        get_trading_client().cancel_order_by_id(order_id)
+        return {"cancelled": True, "error": None}
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        return {"cancelled": False, "error": str(exc)}
 
 
 def submit_limit_order(ticker: str, side: str, qty: float, limit_price: float) -> dict:

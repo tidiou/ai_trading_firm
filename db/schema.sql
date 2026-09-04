@@ -6,13 +6,25 @@
 -- so the schema doesn't need to change every time a rubric is
 -- tuned.
 -- ============================================================
+-- IDEMPOTENT BY DESIGN. Every CREATE is IF NOT EXISTS, so running this
+-- file against an existing database is safe and creates only what is
+-- missing. That matters because this project gets re-downloaded into a
+-- fresh folder periodically while the Docker volume persists, and it is
+-- easy for a table added late in the build to exist in this file but
+-- never in the running database — which surfaces as an UndefinedTable
+-- error halfway through an agent, at the worst possible moment.
+--
+-- WHAT IT DOES NOT DO: add a missing COLUMN to a table that already
+-- exists. IF NOT EXISTS skips such a table whole. Columns are the job
+-- of db/migrations/*.sql, and `python -m core.check_schema` reports
+-- both kinds of drift before you find them at runtime.
 
 -- ---------------------------------------------------------
 -- Cross-cutting: one row per agent invocation, every day.
 -- This IS the audit trail Clara's process-compliance checks
 -- depend on — never delete from this table.
 -- ---------------------------------------------------------
-CREATE TABLE agent_runs (
+CREATE TABLE IF NOT EXISTS agent_runs (
     id              BIGSERIAL PRIMARY KEY,
     run_date        DATE NOT NULL,
     agent_name      TEXT NOT NULL,          -- 'atlas' | 'vera' | 'solomon' | ...
@@ -28,7 +40,7 @@ CREATE TABLE agent_runs (
 -- ============================================================
 -- 1. ATLAS — Macro/Market Intelligence
 -- ============================================================
-CREATE TABLE macro_briefs (
+CREATE TABLE IF NOT EXISTS macro_briefs (
     id                    BIGSERIAL PRIMARY KEY,
     brief_date            DATE NOT NULL UNIQUE,
     regime_signal         TEXT NOT NULL,   -- risk-on|risk-off|neutral|transitioning
@@ -40,12 +52,35 @@ CREATE TABLE macro_briefs (
 );
 
 -- ============================================================
+-- Cross-cutting: trading_control (the kill switch)
+-- ============================================================
+
+-- APPEND-ONLY. Current state is the LATEST row; halting and resuming
+-- both INSERT, so the table is its own audit history and you can
+-- always answer "when was it halted, by whom, and why" without a
+-- separate log. Never UPDATE or DELETE here.
+--
+-- An empty table means trading is ENABLED. That is a deliberate
+-- bootstrap exception: a fresh install has no rows and must work.
+-- The migration seeds an explicit enabled row so the exception is
+-- only ever hit on day one.
+CREATE TABLE IF NOT EXISTS trading_control (
+    id              BIGSERIAL PRIMARY KEY,
+    trading_enabled BOOLEAN NOT NULL,
+    changed_by      TEXT NOT NULL,
+    reason          TEXT NOT NULL,   -- mandatory both ways; a resume
+                                     -- without a reason is how a halt
+                                     -- gets silently forgotten
+    changed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================
 -- 2. VERA — Equity Research
 -- ============================================================
 
 -- A thesis is opened when a position is first proposed and stays
 -- open (and gets referenced daily) until the position is closed.
-CREATE TABLE theses (
+CREATE TABLE IF NOT EXISTS theses (
     id                  BIGSERIAL PRIMARY KEY,
     ticker              TEXT NOT NULL,
     opened_date         DATE NOT NULL,
@@ -54,11 +89,16 @@ CREATE TABLE theses (
     catalyst            TEXT,
     original_conviction SMALLINT NOT NULL CHECK (original_conviction BETWEEN 1 AND 5),
     valuation_snapshot  JSONB,
-    key_risks           JSONB
+    key_risks           JSONB,
+    -- Captured from the FMP profile Vera already fetches at research
+    -- time, so the sector limit costs no extra API quota. NULL means
+    -- genuinely unknown, and Nora treats an unknown-sector name as its
+    -- own single-name bucket rather than pooling it with other unknowns.
+    sector              TEXT
 );
 
 -- Daily monitoring tag for every currently held position.
-CREATE TABLE position_monitoring_log (
+CREATE TABLE IF NOT EXISTS position_monitoring_log (
     id                BIGSERIAL PRIMARY KEY,
     log_date          DATE NOT NULL,
     thesis_id         BIGINT NOT NULL REFERENCES theses(id),
@@ -71,7 +111,7 @@ CREATE TABLE position_monitoring_log (
 );
 
 -- New candidates surfaced that day (zero rows is a normal day).
-CREATE TABLE new_candidates (
+CREATE TABLE IF NOT EXISTS new_candidates (
     id                 BIGSERIAL PRIMARY KEY,
     candidate_date     DATE NOT NULL,
     ticker             TEXT NOT NULL,
@@ -80,20 +120,21 @@ CREATE TABLE new_candidates (
     conviction_score   SMALLINT CHECK (conviction_score BETWEEN 1 AND 5),
     key_risks          JSONB,
     valuation_snapshot JSONB,
+    sector             TEXT,           -- from the FMP profile; see theses.sector
     UNIQUE (candidate_date, ticker)
 );
 
 -- ============================================================
 -- 3. SOLOMON — CIO/Strategy
 -- ============================================================
-CREATE TABLE strategy_decisions (
+CREATE TABLE IF NOT EXISTS strategy_decisions (
     id             BIGSERIAL PRIMARY KEY,
     decision_date  DATE NOT NULL UNIQUE,
     action_needed  BOOLEAN NOT NULL,
     narrative      TEXT
 );
 
-CREATE TABLE proposals (
+CREATE TABLE IF NOT EXISTS proposals (
     id                BIGSERIAL PRIMARY KEY,
     strategy_decision_id BIGINT NOT NULL REFERENCES strategy_decisions(id),
     ticker            TEXT NOT NULL,
@@ -110,24 +151,30 @@ CREATE TABLE proposals (
 -- Versioned, human-editable risk policy. Code reads the row
 -- with the latest effective_date <= today. Never overwritten —
 -- a new version is inserted when limits are tuned.
-CREATE TABLE risk_policy_versions (
+CREATE TABLE IF NOT EXISTS risk_policy_versions (
     id                    BIGSERIAL PRIMARY KEY,
     effective_date        DATE NOT NULL,
     max_position_pct      NUMERIC(5,2) NOT NULL,   -- e.g. 8.00
     max_sector_pct        NUMERIC(5,2) NOT NULL,   -- e.g. 25.00
     drawdown_breaker_pct  NUMERIC(5,2) NOT NULL,   -- e.g. -10.00
     min_position_count    SMALLINT NOT NULL,
+    -- NOT a stop-loss (no automatic exit) — crossing this threshold
+    -- triggers mandatory investigation during Vera's daily monitoring
+    -- (systematic/market-wide decline vs company-specific problem),
+    -- never an automatic action. Same principle for the gain side.
+    loss_review_pct       NUMERIC(5,2) NOT NULL DEFAULT -10.00,
+    profit_review_pct     NUMERIC(5,2) NOT NULL DEFAULT 20.00,
     notes                 TEXT
 );
 
-CREATE TABLE risk_reviews (
+CREATE TABLE IF NOT EXISTS risk_reviews (
     id                     BIGSERIAL PRIMARY KEY,
     review_date            DATE NOT NULL UNIQUE,
     portfolio_status       TEXT NOT NULL,  -- within_limits|breach_warning|breach_hard
     circuit_breaker_active BOOLEAN NOT NULL DEFAULT FALSE
 );
 
-CREATE TABLE risk_breaches (
+CREATE TABLE IF NOT EXISTS risk_breaches (
     id              BIGSERIAL PRIMARY KEY,
     risk_review_id  BIGINT NOT NULL REFERENCES risk_reviews(id),
     ticker          TEXT,
@@ -137,7 +184,7 @@ CREATE TABLE risk_breaches (
     source          TEXT NOT NULL  -- 'existing_position' | 'proposal'
 );
 
-CREATE TABLE proposal_reviews (
+CREATE TABLE IF NOT EXISTS proposal_reviews (
     id             BIGSERIAL PRIMARY KEY,
     proposal_id    BIGINT NOT NULL REFERENCES proposals(id),
     decision       TEXT NOT NULL,   -- approved|rejected
@@ -149,7 +196,7 @@ CREATE TABLE proposal_reviews (
 -- ============================================================
 -- 5. MARCUS — Portfolio Manager
 -- ============================================================
-CREATE TABLE allocations (
+CREATE TABLE IF NOT EXISTS allocations (
     id                 BIGSERIAL PRIMARY KEY,
     allocation_date    DATE NOT NULL,
     proposal_review_id BIGINT REFERENCES proposal_reviews(id),
@@ -164,7 +211,7 @@ CREATE TABLE allocations (
 -- ============================================================
 -- 6. ADA — Execution
 -- ============================================================
-CREATE TABLE orders (
+CREATE TABLE IF NOT EXISTS orders (
     id               BIGSERIAL PRIMARY KEY,
     allocation_id    BIGINT REFERENCES allocations(id),
     order_date       DATE NOT NULL,
@@ -185,7 +232,7 @@ CREATE TABLE orders (
 
 -- Append-only ledger. NEVER UPDATE or DELETE rows here —
 -- corrections are inserted as new rows referencing the original.
-CREATE TABLE transactions (
+CREATE TABLE IF NOT EXISTS transactions (
     id                    BIGSERIAL PRIMARY KEY,
     transaction_date      DATE NOT NULL,
     ticker                TEXT NOT NULL,
@@ -194,6 +241,13 @@ CREATE TABLE transactions (
     price                 NUMERIC(12,4) NOT NULL,
     amount                NUMERIC(14,2) NOT NULL,
     alpaca_transaction_id TEXT,
+    -- Realized P&L booked ON THIS TRANSACTION: (sale price - average
+    -- cost at the moment of sale) x shares. Zero for a buy, NULL when
+    -- the cost basis could not be established (a holding with no
+    -- position row, e.g. an orphan). Recorded here, at the point of
+    -- sale, because average cost is only knowable BEFORE the positions
+    -- table is rebuilt to match the broker.
+    realized_pnl    NUMERIC(14,2),
     corrects_txn_id       BIGINT REFERENCES transactions(id),
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -201,26 +255,71 @@ CREATE TABLE transactions (
 -- Current state, derived/recomputed from transactions each day —
 -- this is the table Nora, Marcus, and Vera should all read from
 -- for "current portfolio state," never a raw Alpaca call.
-CREATE TABLE positions (
+CREATE TABLE IF NOT EXISTS positions (
     ticker           TEXT PRIMARY KEY,
     shares           NUMERIC(14,4) NOT NULL,
     avg_cost         NUMERIC(12,4) NOT NULL,
     market_value     NUMERIC(14,2),
     unrealized_pnl   NUMERIC(14,2),
     weight_pct       NUMERIC(5,2),
-    last_updated     DATE NOT NULL
+    last_updated     DATE NOT NULL,
+    -- Carried across by Otis from the open thesis / candidate row.
+    -- This is what makes Nora's max_sector_pct limit enforceable.
+    sector           TEXT
 );
 
-CREATE TABLE daily_pnl (
+-- DAILY snapshot per held position — one row per ticker per day,
+-- unlike `positions` above which holds current state only and is
+-- rebuilt each day. Otis UPSERTS today's row, so a same-day rerun
+-- refreshes the snapshot rather than failing; earlier days are never
+-- touched. (It previously claimed to be append-only, which the code
+-- never was — the comment was the thing that was wrong.) Needed so Vera can distinguish a sustained
+-- trend from a single-day spike when deciding whether a gain/loss is
+-- "real" or noise — a one-row-per-day snapshot is exactly what that
+-- judgment needs and `positions` alone can't provide.
+CREATE TABLE IF NOT EXISTS position_pnl_history (
+    id                BIGSERIAL PRIMARY KEY,
+    snapshot_date     DATE NOT NULL,
+    ticker            TEXT NOT NULL,
+    unrealized_pnl_pct NUMERIC(8,3) NOT NULL,
+    market_value      NUMERIC(14,2),
+    weight_pct        NUMERIC(5,2),
+    UNIQUE (snapshot_date, ticker)
+);
+
+-- THE THREE P&L COLUMNS ARE DAILY FLOWS AND THEY RECONCILE:
+--     realized_pnl + unrealized_pnl = total_pnl = nav - previous nav
+--
+-- realized_pnl    P&L crystallised by TODAY'S sales, from the
+--                 transaction ledger.
+-- unrealized_pnl  the change in mark-to-market on positions still open
+--                 — today's movement, NOT the lifetime open gain.
+-- open_unrealized_pnl is the lifetime figure, and is a STOCK not a
+--                 flow, which is why it sits apart from the three above.
+--
+-- These were previously conflated: realized was computed as
+-- (today's equity delta) - (LIFETIME unrealized across all positions),
+-- subtracting a cumulative quantity from a daily one. The result was
+-- not an approximation, it was a category error, and it fed Clara's
+-- attribution.
+CREATE TABLE IF NOT EXISTS daily_pnl (
     pnl_date        DATE PRIMARY KEY,
     realized_pnl    NUMERIC(14,2) NOT NULL,
     unrealized_pnl  NUMERIC(14,2) NOT NULL,
     total_pnl       NUMERIC(14,2) NOT NULL,
+    open_unrealized_pnl NUMERIC(14,2),
     cash_balance    NUMERIC(14,2) NOT NULL,
-    reconciled      BOOLEAN NOT NULL DEFAULT FALSE
+    reconciled      BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Total account equity at the close. This is the series the
+    -- drawdown circuit breaker runs on: drawdown is (nav - peak_nav)
+    -- / peak_nav. It must NOT be computed from total_pnl, which is a
+    -- single day's figure rather than an equity curve — taking the
+    -- peak of that measures distance from your best DAY, not from the
+    -- portfolio's high-water mark.
+    nav             NUMERIC(14,2)
 );
 
-CREATE TABLE discrepancies (
+CREATE TABLE IF NOT EXISTS discrepancies (
     id             BIGSERIAL PRIMARY KEY,
     found_date     DATE NOT NULL,
     ticker         TEXT,
@@ -234,7 +333,7 @@ CREATE TABLE discrepancies (
 -- ============================================================
 -- 8. CLARA — Performance/Compliance
 -- ============================================================
-CREATE TABLE attribution (
+CREATE TABLE IF NOT EXISTS attribution (
     id               BIGSERIAL PRIMARY KEY,
     attribution_date DATE NOT NULL,
     ticker           TEXT NOT NULL,
@@ -243,14 +342,14 @@ CREATE TABLE attribution (
     thesis_status    TEXT
 );
 
-CREATE TABLE process_checks (
+CREATE TABLE IF NOT EXISTS process_checks (
     id             BIGSERIAL PRIMARY KEY,
     check_date     DATE NOT NULL UNIQUE,
     process_check  TEXT NOT NULL,   -- clean|violation_found
     violations     JSONB
 );
 
-CREATE TABLE weekly_reports (
+CREATE TABLE IF NOT EXISTS weekly_reports (
     id                     BIGSERIAL PRIMARY KEY,
     week_of                DATE NOT NULL UNIQUE,
     portfolio_return_pct   NUMERIC(6,3),
@@ -262,15 +361,73 @@ CREATE TABLE weekly_reports (
 );
 
 -- Compiled once per day by Clara (Operating Manual §7.8).
-CREATE TABLE daily_reports (
+CREATE TABLE IF NOT EXISTS daily_reports (
     report_date        DATE PRIMARY KEY,
     executive_summary  TEXT,
     full_report_md     TEXT NOT NULL
 );
 
 -- ============================================================
+-- APPEND-ONLY ENFORCEMENT
+--
+-- The two ledgers below say they are append-only. Until migration 006
+-- that was a comment and nothing more — and a comment does not stop a
+-- bug, a migration, or a late-night psql session from rewriting
+-- history. Since realized P&L is derived from `transactions`, an
+-- edited row silently changes reported performance.
+--
+-- The distinction between a ledger and a table is this enforcement.
+--
+-- Note the TRUNCATE triggers: a row-level trigger does not fire on
+-- TRUNCATE, so without them the tables could be emptied straight past
+-- the protection. What this still cannot stop is DROP TABLE, or a
+-- superuser who means it — the claim is that accidental damage becomes
+-- impossible and deliberate damage becomes visible, no more.
+--
+-- Escape hatch, documented on purpose (see migration 006):
+--   ALTER TABLE transactions DISABLE TRIGGER transactions_append_only;
+-- ============================================================
+CREATE OR REPLACE FUNCTION refuse_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION
+        '% is append-only — % is not permitted. %',
+        TG_TABLE_NAME, TG_OP, TG_ARGV[0]
+        USING ERRCODE = 'restrict_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS transactions_append_only ON transactions;
+CREATE TRIGGER transactions_append_only
+    BEFORE UPDATE OR DELETE ON transactions
+    FOR EACH ROW
+    EXECUTE FUNCTION refuse_mutation(
+        'Correct an error by INSERTing a new row with corrects_txn_id set to the original.'
+    );
+
+DROP TRIGGER IF EXISTS transactions_no_truncate ON transactions;
+CREATE TRIGGER transactions_no_truncate
+    BEFORE TRUNCATE ON transactions
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION refuse_mutation('The trade ledger cannot be emptied.');
+
+DROP TRIGGER IF EXISTS trading_control_append_only ON trading_control;
+CREATE TRIGGER trading_control_append_only
+    BEFORE UPDATE OR DELETE ON trading_control
+    FOR EACH ROW
+    EXECUTE FUNCTION refuse_mutation(
+        'Change the state by INSERTing a new row — the current state is the latest one.'
+    );
+
+DROP TRIGGER IF EXISTS trading_control_no_truncate ON trading_control;
+CREATE TRIGGER trading_control_no_truncate
+    BEFORE TRUNCATE ON trading_control
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION refuse_mutation('The halt history cannot be emptied.');
+
+
+-- ============================================================
 -- Indexes worth having from day one
 -- ============================================================
-CREATE INDEX idx_position_monitoring_date ON position_monitoring_log(log_date);
-CREATE INDEX idx_transactions_ticker_date ON transactions(ticker, transaction_date);
-CREATE INDEX idx_agent_runs_date_status ON agent_runs(run_date, status);
+CREATE INDEX IF NOT EXISTS idx_position_monitoring_date ON position_monitoring_log(log_date);
+CREATE INDEX IF NOT EXISTS idx_transactions_ticker_date ON transactions(ticker, transaction_date);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_date_status ON agent_runs(run_date, status);

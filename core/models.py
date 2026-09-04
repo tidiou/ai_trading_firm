@@ -45,6 +45,24 @@ class AgentRun(Base):
 
 
 # ============================================================
+# Cross-cutting: trading_control (the kill switch)
+# ============================================================
+class TradingControl(Base):
+    """
+    APPEND-ONLY. Current state is the latest row by id — halting and
+    resuming both insert, so the table doubles as the audit history.
+    Never update or delete a row here.
+    """
+    __tablename__ = "trading_control"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trading_enabled: Mapped[bool]
+    changed_by: Mapped[str]
+    reason: Mapped[str]
+    changed_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
+
+
+# ============================================================
 # 1. Atlas
 # ============================================================
 class MacroBrief(Base):
@@ -75,6 +93,10 @@ class Thesis(Base):
     original_conviction: Mapped[int]
     valuation_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
     key_risks: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # Captured from the FMP profile Vera already fetches, so the sector
+    # limit costs no extra quota. None = genuinely unknown; Nora treats
+    # an unknown-sector name as its own bucket rather than pooling it.
+    sector: Mapped[Optional[str]]
 
 
 class PositionMonitoringLog(Base):
@@ -103,6 +125,7 @@ class NewCandidate(Base):
     conviction_score: Mapped[Optional[int]]
     key_risks: Mapped[Optional[dict]] = mapped_column(JSONB)
     valuation_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
+    sector: Mapped[Optional[str]]  # from the FMP profile; see Thesis.sector
 
 
 # ============================================================
@@ -141,6 +164,12 @@ class RiskPolicyVersion(Base):
     max_sector_pct: Mapped[Decimal]
     drawdown_breaker_pct: Mapped[Decimal]
     min_position_count: Mapped[int]
+    # Deliberately NOT a stop-loss (no automatic exit) — a loss beyond
+    # this threshold triggers mandatory INVESTIGATION during Vera's
+    # monitoring pass (is it systematic/market-wide or company-
+    # specific?), never an automatic action. Same principle for gains.
+    loss_review_pct: Mapped[Decimal] = mapped_column(default=-10.0)
+    profit_review_pct: Mapped[Decimal] = mapped_column(default=20.0)
     notes: Mapped[Optional[str]]
 
 
@@ -227,6 +256,9 @@ class Transaction(Base):
     price: Mapped[Decimal]
     amount: Mapped[Decimal]
     alpaca_transaction_id: Mapped[Optional[str]]
+    # Realized on THIS transaction: (sale price - avg cost at sale) x
+    # shares. 0 for a buy, None when cost basis was unknown.
+    realized_pnl: Mapped[Optional[Decimal]]
     corrects_txn_id: Mapped[Optional[int]] = mapped_column(ForeignKey("transactions.id"))
     created_at: Mapped[datetime] = mapped_column(server_default=text("now()"))
 
@@ -241,17 +273,40 @@ class Position(Base):
     unrealized_pnl: Mapped[Optional[Decimal]]
     weight_pct: Mapped[Optional[Decimal]]
     last_updated: Mapped[date]
+    # Carried across by Otis from the open thesis / candidate row.
+    # This is what makes Nora's max_sector_pct limit enforceable.
+    sector: Mapped[Optional[str]]
+
+
+class PositionPnlHistory(Base):
+    __tablename__ = "position_pnl_history"
+    __table_args__ = (UniqueConstraint("snapshot_date", "ticker"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    snapshot_date: Mapped[date]
+    ticker: Mapped[str]
+    unrealized_pnl_pct: Mapped[Decimal]
+    market_value: Mapped[Optional[Decimal]]
+    weight_pct: Mapped[Optional[Decimal]]
 
 
 class DailyPnl(Base):
     __tablename__ = "daily_pnl"
 
     pnl_date: Mapped[date] = mapped_column(primary_key=True)
-    realized_pnl: Mapped[Decimal]
-    unrealized_pnl: Mapped[Decimal]
+    # Daily FLOWS, and they reconcile:
+    #   realized_pnl + unrealized_pnl = total_pnl = nav - previous nav
+    realized_pnl: Mapped[Decimal]     # crystallised by today's sales
+    unrealized_pnl: Mapped[Decimal]   # today's mark-to-market change
     total_pnl: Mapped[Decimal]
+    # A STOCK, not a flow: lifetime open gain across held positions.
+    open_unrealized_pnl: Mapped[Optional[Decimal]]
     cash_balance: Mapped[Decimal]
     reconciled: Mapped[bool] = mapped_column(default=False)
+    # Account equity at the close — the series the drawdown circuit
+    # breaker runs on. Deliberately NOT derived from total_pnl, which
+    # is one day's figure rather than an equity curve.
+    nav: Mapped[Optional[Decimal]]
 
 
 class Discrepancy(Base):

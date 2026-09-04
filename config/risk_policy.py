@@ -10,4 +10,9 @@ DEFAULT_RISK_POLICY = {
     "max_sector_pct": 25.0,
     "drawdown_breaker_pct": -10.0,
     "min_position_count": 12,
+    # NOT a stop-loss/take-profit — these only trigger mandatory
+    # investigation during Vera's monitoring pass, never an automatic
+    # exit or sale. See agents/nora.py and agents/vera.py.
+    "loss_review_pct": -10.0,
+    "profit_review_pct": 20.0,
 }
