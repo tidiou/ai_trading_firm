@@ -223,7 +223,12 @@ CREATE TABLE IF NOT EXISTS orders (
     status           TEXT NOT NULL,      -- filled|partial|pending|rejected
     fill_price       NUMERIC(12,4),
     slippage_bps     NUMERIC(8,2),
-    alpaca_order_id  TEXT
+    alpaca_order_id  TEXT,
+    -- Human-readable context for `status` (migration 007): the ledger
+    -- state on a refusal, the arithmetic on a rejected size, the sizing
+    -- basis on an accepted order. A status is a verdict; this is the
+    -- reason. Never parsed by code.
+    status_detail    TEXT
 );
 
 -- ============================================================

@@ -135,6 +135,140 @@ def esc(v) -> str:
 
 
 # =================================================================
+# TABLES
+#
+# st.dataframe(use_container_width=True) gives every column an equal
+# slice of the container, so a 300-word thesis and a 4-character ticker
+# get the same room — the thesis is clipped to "The compa…" and there is
+# nothing wider to scroll to, because nothing is wider.
+#
+# So: prose columns are declared, given a large width, and the grid is
+# left at its natural size, which is what makes it scroll sideways.
+# Tables with no prose still fill the container, since stretching six
+# short columns across the page is fine and looks better.
+#
+# The grid is still a grid, though — no column width makes a paragraph
+# readable in a cell. Any table holding prose therefore also gets a
+# "read a row in full" panel underneath, which is the escape hatch that
+# works regardless of what the grid does with widths.
+# =================================================================
+PROSE_COLUMNS = {
+    "narrative", "thesis", "thesis_text", "reasoning", "rationale", "detail",
+    "description", "error_message", "catalyst", "executive_summary",
+    "resolution_note", "trigger", "linked_trigger", "activity", "violations",
+    "expected", "actual", "key_risks", "notes",
+}
+
+_table_seq = [0]
+
+
+def records(df: pd.DataFrame, title_cols: list[str], body_col: str,
+            tone: str = "warn") -> None:
+    """
+    Render rows as readable text blocks instead of grid cells.
+
+    For the handful of tables whose whole point is a sentence — an open
+    discrepancy, a compliance violation — a grid is the wrong container.
+    st.column_config.TextColumn(width="large") caps a column at roughly
+    400px and truncates past it; it does not widen to fit. And once the
+    grid fits inside the container there is no overflow, so there is
+    nothing to scroll sideways to either. The text is simply gone.
+
+    A paragraph belongs in a paragraph.
+    """
+    if df is None or df.empty:
+        return
+    edge = {"warn": C["oxblood"], "note": C["amber"], "ok": C["green"]}.get(tone, C["rule"])
+    for _, row in df.iterrows():
+        head = " · ".join(
+            str(row[c]) for c in title_cols
+            if c in df.columns and row[c] is not None and str(row[c]).strip()
+        )
+        body = str(row[body_col]) if body_col in df.columns and row[body_col] else ""
+        extras = "".join(
+            f'<div class="mby-rec-kv"><span>{_html.escape(c)}</span>'
+            f'<span>{_html.escape(str(row[c]))}</span></div>'
+            for c in df.columns
+            if c not in title_cols + [body_col]
+            and row[c] is not None and str(row[c]).strip()
+            and not isinstance(row[c], (bool,))
+        )
+        st.markdown(
+            f'<div class="mby-rec" style="border-left-color:{edge}">'
+            f'<div class="mby-rec-head">{_html.escape(head)}</div>'
+            f'<div class="mby-rec-body">{_html.escape(body)}</div>'
+            f'{extras}</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def _row_label(df: pd.DataFrame, i: int) -> str:
+    """A one-line name for a row, built from its shortest identifying
+    columns — a date and a ticker beat 'row 3'."""
+    row = df.iloc[i]
+    bits = []
+    for c in df.columns:
+        if c in PROSE_COLUMNS or len(bits) >= 3:
+            continue
+        v = row[c]
+        if v is None or (not isinstance(v, (list, dict)) and pd.isna(v)):
+            continue
+        t = str(v)
+        if len(t) <= 24:
+            bits.append(t)
+    return " · ".join(bits) if bits else f"row {i + 1}"
+
+
+def table(df: pd.DataFrame, height: int | None = None,
+          prose: set[str] | None = None, full: bool = True) -> None:
+    if df is None or df.empty:
+        return
+
+    cols = PROSE_COLUMNS | set(prose or ())
+    long_cols = [c for c in df.columns if c in cols]
+
+    cfg = None
+    try:
+        if long_cols:
+            cfg = {c: st.column_config.TextColumn(c, width="large")
+                   for c in long_cols}
+    except Exception:
+        # column_config arrived in Streamlit 1.23; an older one still
+        # gets the natural-width grid below, which is the important half.
+        cfg = None
+
+    kwargs = {"hide_index": True}
+    if cfg:
+        kwargs["column_config"] = cfg
+    if height is not None:
+        kwargs["height"] = height
+    # Natural width (and therefore a horizontal scrollbar) whenever a
+    # column holds prose; fill the container when nothing does.
+    kwargs["use_container_width"] = not long_cols
+
+    st.dataframe(df, **kwargs)
+
+    if full and long_cols:
+        _table_seq[0] += 1
+        n = len(df)
+        with st.expander(f"Read a row in full — {n} row{'s' if n != 1 else ''}",
+                         expanded=n <= 5):
+            i = st.selectbox(
+                "Row", range(n), format_func=lambda k: _row_label(df, k),
+                key=f"mby-row-{_table_seq[0]}", label_visibility="collapsed")
+            row = df.iloc[i]
+            for c in df.columns:
+                v = row[c]
+                if v is None or (not isinstance(v, (list, dict)) and pd.isna(v)):
+                    continue
+                st.markdown(f"**{c}**")
+                if isinstance(v, (list, dict)):
+                    st.json(v)
+                else:
+                    st.text(str(v))
+
+
+# =================================================================
 # ROUTING
 #
 # The whole app hangs off one query parameter. Anchors rather than
@@ -244,12 +378,20 @@ WALL_CSS = """
 <style>
   @import url('""" + FONTS + """');
   * { box-sizing: border-box; }
-  body { margin: 0; background: """ + C["ground"] + """;
+  /* overflow-x is the last line of defence: below the narrowest media
+     query the strip scrolls rather than being clipped by the iframe. */
+  body { margin: 0; background: """ + C["ground"] + """; overflow-x: auto;
+         overflow-y: hidden;
          font-family: Archivo, 'Helvetica Neue', Arial, sans-serif;
          color: """ + C["ink"] + """; }
-  .wall { display: flex; align-items: stretch; height: 200px;
+  .wall { display: flex; align-items: stretch; height: 200px; min-width: 0;
           border-bottom: 2px solid """ + C["rule"] + """; }
-  .plate { width: 372px; flex: none; padding: 26px 30px;
+  /* Everything sizes off flex-basis with min-width:0 rather than a hard
+     width. The old fixed 372 + 420 + 178 needed ~1370px before the two
+     figures had anywhere to go, so a narrower window cut the book and
+     the halt switch off the right-hand edge. */
+  .plate { flex: 1 1 300px; min-width: 220px; max-width: 380px;
+           padding: 22px 24px;
            border-right: 1px solid """ + C["rule"] + """;
            display: flex; flex-direction: column; justify-content: space-between; }
   .brand { font-family: 'Libre Baskerville', Georgia, serif; font-size: 30px;
@@ -262,10 +404,11 @@ WALL_CSS = """
   .state .txt { font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
                 letter-spacing: 0.14em; }
   .state .note { font-size: 11.5px; color: """ + C["faint"] + """; }
-  .clocks { width: 420px; flex: none; border-right: 1px solid """ + C["rule"] + """;
+  .clocks { flex: 0 0 auto; border-right: 1px solid """ + C["rule"] + """;
             background: """ + C["sunk"] + """; display: flex; align-items: center;
-            justify-content: center; gap: 44px; }
-  .clock { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+            justify-content: center; gap: 40px; padding: 0 30px; }
+  .clock { display: flex; flex-direction: column; align-items: center;
+           justify-content: center; gap: 8px; }
   .face { position: relative; width: 92px; height: 92px; border-radius: 50%;
           background: """ + C["panel2"] + """;
           box-shadow: inset 0 2px 10px rgba(0,0,0,0.55); }
@@ -296,17 +439,25 @@ WALL_CSS = """
           font-variant-numeric: tabular-nums; }
   .cnote { font-family: 'JetBrains Mono', monospace; font-size: 10px;
            letter-spacing: 0.08em; }
-  .book { flex: 1; display: flex; align-items: stretch; }
-  .fig { flex: 1; padding: 26px 28px; display: flex; flex-direction: column;
-         justify-content: center; gap: 6px; border-right: 1px solid """ + C["rule"] + """; }
+  .book { flex: 2 1 0; min-width: 0; display: flex; align-items: stretch; }
+  .fig { flex: 1 1 0; min-width: 0; padding: 22px 20px; display: flex;
+         flex-direction: column; justify-content: center; gap: 6px;
+         border-right: 1px solid """ + C["rule"] + """; }
   .cap { font-family: 'JetBrains Mono', monospace; font-size: 10px;
          letter-spacing: 0.16em; color: """ + C["faint"] + """; }
-  .big { font-family: 'JetBrains Mono', monospace; font-size: 30px;
-         font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .big { font-family: 'JetBrains Mono', monospace;
+         font-size: clamp(19px, 2.1vw, 30px);
+         font-variant-numeric: tabular-nums; letter-spacing: -0.01em;
+         white-space: nowrap; }
+  /* A note that outgrows its column ellipsises instead of pushing the
+     next panel off the strip. */
+  .sml, .cap, .state .note, .cnote, .czone { white-space: nowrap;
+         overflow: hidden; text-overflow: ellipsis; }
   .sml { font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
          color: """ + C["faint"] + """; }
   .sml b { font-weight: 400; }
-  .ctrl { width: 178px; flex: none; padding: 22px; background: """ + C["sunk"] + """;
+  .ctrl { flex: 0 0 auto; width: 168px; padding: 20px 16px;
+          background: """ + C["sunk"] + """;
           display: flex; flex-direction: column; justify-content: center;
           align-items: center; gap: 11px; }
   .switch { width: 100%; border-radius: 2px; padding: 12px 0; text-align: center;
@@ -314,6 +465,27 @@ WALL_CSS = """
             letter-spacing: 0.16em; }
   .ctrl .hint { font-size: 10.5px; color: """ + C["faint"] + """; text-align: center;
                 line-height: 1.4; }
+
+  /* Shed the least load-bearing thing first, in order. The Berlin analog
+     face goes before the New York one because Berlin is only where you
+     are sitting; New York governs the session. The digital readouts and
+     the session countdown never go. */
+  @media (max-width: 1280px) {
+    .face.loc { display: none; }
+    .clocks { gap: 30px; padding: 0 22px; }
+    .plate { padding: 20px; }
+  }
+  @media (max-width: 1080px) {
+    .face { display: none; }
+    .clocks { gap: 26px; padding: 0 18px; }
+    .plate { max-width: 300px; min-width: 200px; }
+    .ctrl { width: 146px; }
+    .fig { padding: 18px 14px; }
+  }
+  @media (max-width: 900px) {
+    .plate .sub, .ctrl .hint, .fig .sml { display: none; }
+    .brand { font-size: 24px; }
+  }
 </style>
 """
 
@@ -472,7 +644,7 @@ def render_wall() -> None:
     js = WALL_JS.replace(
         "BOUNDARY_ISO",
         f'"{boundary_at.isoformat()}"' if boundary_at else "null")
-    components.html(WALL_CSS + body + js, height=202, scrolling=False)
+    components.html(WALL_CSS + body + js, height=214, scrolling=False)
 
 
 # =================================================================
@@ -514,6 +686,21 @@ PAGE_CSS = """
     font-variant-numeric: tabular-nums; }
   .mby-sec { font-family: 'JetBrains Mono', monospace; font-size: 10px;
     letter-spacing: 0.18em; color: """ + C["brass"] + """; }
+  .mby-rec { background: """ + C["panel"] + """;
+    border: 1px solid """ + C["rule"] + """;
+    border-left: 3px solid """ + C["oxblood"] + """;
+    border-radius: 2px; padding: 12px 16px; margin-bottom: 8px; }
+  .mby-rec-head { font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    letter-spacing: .1em; color: """ + C["brass"] + """;
+    text-transform: uppercase; margin-bottom: 6px; }
+  .mby-rec-body { font-size: 13.5px; line-height: 1.6;
+    color: """ + C["ink"] + """;
+    overflow-wrap: anywhere; white-space: pre-wrap; }
+  .mby-rec-kv { display: flex; gap: 10px; margin-top: 6px;
+    font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    color: """ + C["faint"] + """; }
+  .mby-rec-kv span:last-child { color: """ + C["muted"] + """;
+    overflow-wrap: anywhere; }
   .mby-missing { color: """ + C["faint"] + """;
     border-bottom: 1px dotted """ + C["rule_strong"] + """; cursor: help; }
 
@@ -529,12 +716,20 @@ PAGE_CSS = """
   .mby-ph .l { font-size: 12.5px; }
   .mby-ph .t { margin-left: auto; font-family: 'JetBrains Mono', monospace;
     font-size: 10px; color: """ + C["faint"] + """; }
+  .mby-rail { flex-wrap: wrap; }
+  .mby-ph { min-width: 210px; }
 
   /* --- the desks ------------------------------------------- */
   .mby-desks { display: grid; grid-template-columns: repeat(3, minmax(0,1fr));
     gap: 1px; background: """ + C["rule"] + """; }
   .mby-desk { background: """ + C["ground"] + """; padding: 20px 24px;
-    display: flex; flex-direction: column; gap: 14px; }
+    display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  @media (max-width: 1250px) {
+    .mby-desks { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  }
+  @media (max-width: 820px) { .mby-desks { grid-template-columns: 1fr; } }
+  .mby-met .k, .mby-met .v { overflow-wrap: anywhere; }
+  .mby-role, .mby-name { overflow-wrap: anywhere; }
   .mby-deskhd { display: flex; align-items: center; gap: 10px; }
   .mby-deskhd span { font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
     letter-spacing: 0.16em; color: """ + C["brass"] + """; }
@@ -585,6 +780,9 @@ PAGE_CSS = """
     color: """ + C["muted"] + """; white-space: nowrap; }
   .mby-tape .sep { color: """ + C["rule"] + """; }
   .mby-tape .ts { color: """ + C["faint"] + """; }
+  /* The tape is one long line by nature — let it scroll rather than
+     silently dropping the events past the right edge. */
+  .mby-tape { overflow-x: auto; }
 
   /* --- dossier --------------------------------------------- */
   .mby-dossier { display: flex; align-items: center; gap: 18px; padding: 22px 28px;
@@ -607,7 +805,10 @@ PAGE_CSS = """
     border-bottom: 1px solid """ + C["panel2"] + """; }
   .mby-kv .v { padding: 7px 28px; font-family: 'JetBrains Mono', monospace;
     font-size: 13px; font-variant-numeric: tabular-nums; text-align: right;
-    color: """ + C["ink"] + """; border-bottom: 1px solid """ + C["panel2"] + """; }
+    color: """ + C["ink"] + """; border-bottom: 1px solid """ + C["panel2"] + """;
+    overflow-wrap: anywhere; }
+  .mby-kv .k { overflow-wrap: anywhere; }
+  .mby-quote, .mby-say .body { overflow-wrap: anywhere; }
   .mby-band { padding: 7px 28px; background: """ + C["panel2"] + """;
     border-top: 1px solid """ + C["rule"] + """;
     border-bottom: 1px solid """ + C["rule"] + """; }
@@ -616,7 +817,8 @@ PAGE_CSS = """
   .mby-bar div { height: 100%; }
 
   /* --- conference room ------------------------------------- */
-  .mby-room { display: flex; justify-content: center; background: """ + C["sunk"] + """;
+  .mby-room { display: flex; justify-content: center; overflow-x: auto;
+    background: """ + C["sunk"] + """;
     border-bottom: 1px solid """ + C["rule"] + """; }
   /* Fixed-width stage inside a centring band: the seats are placed in
      absolute px, so they and the centred table need one shared origin.
@@ -1077,7 +1279,7 @@ def page_agent(desk: Desk, name: str) -> None:
     if runs.empty:
         st.info(f"{name} has never run.")
     else:
-        st.dataframe(runs, use_container_width=True, height=260)
+        table(runs, height=260)
 
 
 # ---- per-agent detail ------------------------------------------
@@ -1088,7 +1290,7 @@ def _d_atlas(desk: Desk) -> None:
     if df.empty:
         st.info("Atlas has not produced a brief yet.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
     if desk.macro is not None and desk.macro["narrative"]:
         st.subheader(f"Latest narrative — {desk.macro['brief_date']}")
         st.write(desk.macro["narrative"])
@@ -1102,7 +1304,7 @@ def _d_vera(desk: Desk) -> None:
     if df.empty:
         st.info("No open theses.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
     st.subheader("Candidate history")
     df = load("SELECT candidate_date, ticker, conviction_score, sector, catalyst "
@@ -1110,7 +1312,7 @@ def _d_vera(desk: Desk) -> None:
     if df.empty:
         st.info("Nothing surfaced yet.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
     st.subheader("Position monitoring")
     df = load("SELECT log_date, ticker, status, trigger, conviction_score, reasoning "
@@ -1118,7 +1320,7 @@ def _d_vera(desk: Desk) -> None:
     if df.empty:
         st.info("Nothing held to monitor.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
 
 def _d_solomon(desk: Desk) -> None:
@@ -1130,7 +1332,7 @@ def _d_solomon(desk: Desk) -> None:
     if df.empty:
         st.info("Solomon has not decided anything yet.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
     st.subheader("Proposals escalated")
     df = load("""
@@ -1141,7 +1343,7 @@ def _d_solomon(desk: Desk) -> None:
     if df.empty:
         st.info("Nothing has been escalated.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
 
 def _d_nora(desk: Desk) -> None:
@@ -1209,7 +1411,7 @@ def _d_nora(desk: Desk) -> None:
     if df.empty:
         st.success("No limit breaches on record.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
     st.subheader("Proposal reviews")
     st.caption("max_size_pct is HEADROOM — how much more of the book this name may "
@@ -1223,7 +1425,7 @@ def _d_nora(desk: Desk) -> None:
     if df.empty:
         st.info("Nothing has reached her review yet.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
     st.subheader("Review history")
     df = load("SELECT review_date, portfolio_status, circuit_breaker_active "
@@ -1231,7 +1433,7 @@ def _d_nora(desk: Desk) -> None:
     if df.empty:
         st.info("No reviews yet.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
 
 def _d_marcus(desk: Desk) -> None:
@@ -1243,7 +1445,7 @@ def _d_marcus(desk: Desk) -> None:
     if df.empty:
         st.info("Marcus has never sized a position.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
 
 def _d_ada(desk: Desk) -> None:
@@ -1252,7 +1454,7 @@ def _d_ada(desk: Desk) -> None:
         st.info("No orders today. On most days that is correct — the desk runs "
                 "daily but changes the portfolio only when Solomon escalates.")
     else:
-        st.dataframe(desk.orders_today, use_container_width=True)
+        table(desk.orders_today)
 
     st.subheader("Execution quality")
     st.caption("Slippage in basis points against the limit price — Ada's success "
@@ -1266,7 +1468,7 @@ def _d_ada(desk: Desk) -> None:
     if df.empty:
         st.info("No fills with a recorded limit price yet.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
     st.subheader("Order outcomes, all time")
     df = load("SELECT status, count(*) AS orders, min(order_date) AS first_seen, "
@@ -1275,7 +1477,7 @@ def _d_ada(desk: Desk) -> None:
     if df.empty:
         st.info("No orders on record.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
         st.caption(
             "`halted_by_operator` is the kill switch; `halted_circuit_breaker` is "
             "Nora's drawdown freeze; `rejected_zero_shares` means the target was "
@@ -1286,13 +1488,17 @@ def _d_ada(desk: Desk) -> None:
 
 def _d_otis(desk: Desk) -> None:
     st.subheader("Open discrepancies")
-    st.caption("Never auto-resolved — flagged for human review.")
-    df = load("SELECT found_date, ticker, expected, actual, description, resolved "
+    st.caption(
+        "Never auto-resolved — flagged for human review. A discrepancy describes the "
+        "book AT THE MOMENT OTIS FOUND IT; it does not update itself when the "
+        "underlying situation changes, so an item here can be factually stale until "
+        "the next close re-evaluates it.")
+    df = load("SELECT found_date, ticker, expected, actual, description "
               "FROM discrepancies WHERE NOT resolved ORDER BY found_date DESC")
     if df.empty:
         st.success("No unresolved discrepancies.")
     else:
-        st.dataframe(df, use_container_width=True)
+        records(df, title_cols=["found_date", "ticker"], body_col="description")
 
     st.subheader("The book")
     df = load("SELECT ticker, sector, shares, avg_cost, market_value, "
@@ -1301,7 +1507,7 @@ def _d_otis(desk: Desk) -> None:
     if df.empty:
         st.info("No open positions.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
     st.subheader("Daily reconciliation")
     df = load("SELECT pnl_date, nav, total_pnl, realized_pnl, unrealized_pnl, "
@@ -1309,7 +1515,7 @@ def _d_otis(desk: Desk) -> None:
     if df.empty:
         st.info("Otis has not closed a session.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
 
 def _d_clara(desk: Desk) -> None:
@@ -1335,7 +1541,7 @@ def _d_clara(desk: Desk) -> None:
     if df.empty:
         st.info("Nothing held or traded to attribute.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
     st.subheader("Reports filed")
     df = load("SELECT report_date, executive_summary FROM daily_reports "
@@ -1343,7 +1549,7 @@ def _d_clara(desk: Desk) -> None:
     if df.empty:
         st.info("No closing reports filed.")
     else:
-        st.dataframe(df, use_container_width=True)
+        table(df)
 
 
 DETAIL = {"Atlas": _d_atlas, "Vera": _d_vera, "Solomon": _d_solomon, "Nora": _d_nora,
@@ -1542,7 +1748,7 @@ def page_briefing(desk: Desk) -> None:
     if candidates.empty:
         st.info("No candidates surfaced yet.")
     else:
-        st.dataframe(candidates, use_container_width=True)
+        table(candidates)
 
     col3, col4 = st.columns(2)
     with col3:
@@ -1589,7 +1795,7 @@ def page_activity(desk: Desk) -> None:
         if not running.empty:
             st.warning(f"{len(running)} run(s) still marked 'running' — an interrupted "
                        "cycle leaves its last agent in this state.")
-        st.dataframe(runs, use_container_width=True, height=320)
+        table(runs, height=320)
 
     st.divider()
     st.subheader("Output timeline")
@@ -1618,7 +1824,7 @@ def page_activity(desk: Desk) -> None:
         SELECT check_date, 'Clara', 'Process compliance check', process_check
         FROM process_checks
         ORDER BY activity_date DESC""")
-    st.dataframe(activity, use_container_width=True, height=500)
+    table(activity, height=500)
 
 
 def page_research(desk: Desk) -> None:
@@ -1627,9 +1833,8 @@ def page_research(desk: Desk) -> None:
 
 def page_risk(desk: Desk) -> None:
     st.subheader("Strategy Decisions (Solomon)")
-    st.dataframe(load("SELECT decision_date, action_needed, narrative "
-                      "FROM strategy_decisions ORDER BY decision_date DESC"),
-                 use_container_width=True)
+    table(load("SELECT decision_date, action_needed, narrative "
+               "FROM strategy_decisions ORDER BY decision_date DESC"))
 
     st.subheader("Proposals")
     proposals = load("""
@@ -1639,12 +1844,11 @@ def page_risk(desk: Desk) -> None:
     if proposals.empty:
         st.info("No proposals have been escalated yet.")
     else:
-        st.dataframe(proposals, use_container_width=True)
+        table(proposals)
 
     st.subheader("Risk Reviews (Nora)")
-    st.dataframe(load("SELECT review_date, portfolio_status, circuit_breaker_active "
-                      "FROM risk_reviews ORDER BY review_date DESC"),
-                 use_container_width=True)
+    table(load("SELECT review_date, portfolio_status, circuit_breaker_active "
+               "FROM risk_reviews ORDER BY review_date DESC"))
 
     st.subheader("Trading Control (kill switch)")
     st.caption("Manual halt/resume history. Distinct from Nora's drawdown circuit "
@@ -1655,7 +1859,7 @@ def page_risk(desk: Desk) -> None:
     if ctrl.empty:
         st.info("No control rows on record — trading enabled by bootstrap default.")
     else:
-        st.dataframe(ctrl, use_container_width=True)
+        table(ctrl)
 
     st.divider()
     st.subheader("Risk Limit Breaches (Nora)")
@@ -1670,7 +1874,7 @@ def page_risk(desk: Desk) -> None:
     if breaches.empty:
         st.success("No limit breaches on record.")
     else:
-        st.dataframe(breaches, use_container_width=True)
+        table(breaches)
 
     st.subheader("Proposal Reviews (Nora's approve/reject decisions)")
     pr = load("""
@@ -1680,7 +1884,7 @@ def page_risk(desk: Desk) -> None:
     if pr.empty:
         st.info("No proposals have reached Nora's review yet.")
     else:
-        st.dataframe(pr, use_container_width=True)
+        table(pr)
 
     st.divider()
     st.subheader("Process Compliance (Clara)")
@@ -1705,7 +1909,7 @@ def page_risk(desk: Desk) -> None:
     if attribution.empty:
         st.info("No attribution yet — nothing held/traded to attribute.")
     else:
-        st.dataframe(attribution, use_container_width=True)
+        table(attribution)
 
 
 def page_execution(desk: Desk) -> None:
@@ -1725,7 +1929,7 @@ def page_execution(desk: Desk) -> None:
         c1.metric("Filled", int(filled.sum()))
         c2.metric("Working at broker", int(working.sum()))
         c3.metric("Never submitted", int((~reached).sum()))
-        st.dataframe(today_orders, use_container_width=True)
+        table(today_orders)
         if not today_orders[~reached].empty:
             st.caption("Orders that never reached the broker are recorded rather than "
                        "dropped — the status is the reason. A halted day, a stale ledger "
@@ -1747,7 +1951,7 @@ def page_execution(desk: Desk) -> None:
     if chain.empty:
         st.info("No allocations on record yet — Marcus has not sized anything.")
     else:
-        st.dataframe(chain, use_container_width=True)
+        table(chain)
 
     st.divider()
     st.subheader("Cancelled unfilled")
@@ -1761,7 +1965,7 @@ def page_execution(desk: Desk) -> None:
     if expired.empty:
         st.success("Nothing has expired unfilled.")
     else:
-        st.dataframe(expired, use_container_width=True)
+        table(expired)
 
     st.divider()
     st.subheader("Execution quality")
@@ -1776,7 +1980,7 @@ def page_execution(desk: Desk) -> None:
     if slippage.empty:
         st.info("No fills with a recorded limit price yet — nothing to measure.")
     else:
-        st.dataframe(slippage, use_container_width=True)
+        table(slippage)
 
     st.divider()
     st.subheader("Order outcomes, all time")
@@ -1786,7 +1990,7 @@ def page_execution(desk: Desk) -> None:
     if outcomes.empty:
         st.info("No orders on record yet.")
     else:
-        st.dataframe(outcomes, use_container_width=True)
+        table(outcomes)
         st.caption(
             "`halted_by_operator` is the kill switch; `halted_circuit_breaker` is "
             "Nora's drawdown freeze; `rejected_zero_shares` means the target was "
@@ -1797,16 +2001,18 @@ def page_execution(desk: Desk) -> None:
 
 def page_portfolio(desk: Desk) -> None:
     st.subheader("Open Discrepancies (Otis)")
-    st.caption("Never auto-resolved — flagged here for human review.")
-    discrepancies = load("SELECT found_date, ticker, expected, actual, description, "
-                         "resolved FROM discrepancies ORDER BY found_date DESC")
-    unresolved = (discrepancies[~discrepancies["resolved"]]
-                  if not discrepancies.empty else discrepancies)
+    st.caption(
+        "Never auto-resolved — flagged here for human review. Each one describes the "
+        "book AT THE MOMENT OTIS FOUND IT and does not update itself afterwards, so an "
+        "item can be factually stale until the next close re-evaluates it. Read the "
+        "date on it.")
+    unresolved = load("SELECT found_date, ticker, expected, actual, description "
+                      "FROM discrepancies WHERE NOT resolved ORDER BY found_date DESC")
     if unresolved.empty:
         st.success("No unresolved discrepancies.")
     else:
         st.warning(f"{len(unresolved)} unresolved discrepancy(ies):")
-        st.dataframe(unresolved, use_container_width=True)
+        records(unresolved, title_cols=["found_date", "ticker"], body_col="description")
 
     st.subheader("P&L Over Time")
     pnl = load("SELECT pnl_date, nav, total_pnl, realized_pnl, unrealized_pnl, "
@@ -1828,7 +2034,7 @@ def page_portfolio(desk: Desk) -> None:
             "which is why it sits apart. reconciliation_gap should be 0.00 on every "
             "row written from 2 Sept 2026 onward; earlier rows predate the fix and "
             "cannot be recomputed.")
-        st.dataframe(pnl, use_container_width=True)
+        table(pnl)
 
     st.subheader("Current Positions")
     positions = load("SELECT ticker, sector, shares, avg_cost, market_value, "
@@ -1837,7 +2043,7 @@ def page_portfolio(desk: Desk) -> None:
     if positions.empty:
         st.info("No open positions currently held.")
     else:
-        st.dataframe(positions, use_container_width=True)
+        table(positions)
 
 
 ROUTES = {

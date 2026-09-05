@@ -68,8 +68,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from agents.nora import get_active_risk_policy, is_circuit_breaker_active
 from core.clients import alpaca_client
-from core.ledger import LedgerSnapshot, read_snapshot
-from core.trading_control import is_trading_enabled
+from core.ledger import MAX_LEDGER_STALENESS_SESSIONS, LedgerSnapshot, read_snapshot
+from core.trading_control import get_state as get_control_state, is_trading_enabled
 from core.clients.claude_client import run_agent_loop, extract_json
 from core.db import session_scope
 from core.models import Allocation, Order
@@ -108,9 +108,17 @@ BUYING_POWER_SAFETY_MARGIN = 0.98
 
 
 def _order_result(allocation, status: str, limit_price=None, shares=0,
-                  alpaca_order_id=None) -> dict:
+                  alpaca_order_id=None, detail: str | None = None) -> dict:
     """Shape of a row in the orders table. One builder so the several
-    early-return paths below can't drift apart from each other."""
+    early-return paths below can't drift apart from each other.
+
+    `detail` is the evidence behind the status, in words. A status is a
+    verdict — and a verdict alone stops being explainable the moment the
+    condition that produced it is repaired. `rejected_stale_ledger` on
+    4 Sept 2026 was unreadable within the same cycle, because Otis
+    closes the books in Phase 5 and Ada trades in Phase 4: by the time
+    anyone queried the ledger it was fresh, and the row looked like it
+    was contradicting itself. Never parsed by code (migration 007)."""
     return {
         # The link back to the intent this order came from. It was
         # never populated, so Clara's approval-chain audit ran on
@@ -128,6 +136,7 @@ def _order_result(allocation, status: str, limit_price=None, shares=0,
         "fill_price": None,      # fill confirmation is Otis's job
         "slippage_bps": None,
         "alpaca_order_id": alpaca_order_id,
+        "status_detail": detail,
     }
 
 
@@ -252,7 +261,8 @@ def execute_allocation(today: date, allocation: Allocation,
         current_qty = ledger.position_qty(allocation.ticker)
 
     if nav <= 0:
-        return _order_result(allocation, "rejected_no_nav", limit_price=limit_price)
+        return _order_result(allocation, "rejected_no_nav", limit_price=limit_price,
+                             detail=ledger.describe())
 
     target_weight = float(allocation.target_size_pct)
     target_dollars = nav * (target_weight / 100)
@@ -268,15 +278,20 @@ def execute_allocation(today: date, allocation: Allocation,
         # matters — you cannot sell shares the broker doesn't think you
         # have. Otis flags any divergence as a discrepancy at the close.
         if current_qty <= 0:
-            return _order_result(allocation, "rejected_no_position", limit_price=limit_price)
+            return _order_result(allocation, "rejected_no_position", limit_price=limit_price,
+                                 detail=f"{ledger.describe()} — holds no {allocation.ticker}")
         shares, side = current_qty, "sell"
 
     elif allocation.action == "trim":
         if current_qty <= 0:
-            return _order_result(allocation, "rejected_no_position", limit_price=limit_price)
+            return _order_result(allocation, "rejected_no_position", limit_price=limit_price,
+                                 detail=f"{ledger.describe()} — holds no {allocation.ticker}")
         if delta_dollars >= 0:
             # Already at or below where Marcus wants it — nothing to do.
-            return _order_result(allocation, "rejected_already_at_target", limit_price=limit_price)
+            return _order_result(
+                allocation, "rejected_already_at_target", limit_price=limit_price,
+                detail=(f"holding {current_value:,.2f} is already at or below the "
+                        f"{target_weight:.2f}% target ({target_dollars:,.2f})"))
         # Sized from MARCUS's target, not a hardcoded 50%. Ada used to
         # recompute qty * 0.5 herself, which happened to agree with
         # Marcus's current rule — and would have silently overridden
@@ -288,7 +303,10 @@ def execute_allocation(today: date, allocation: Allocation,
 
     else:  # new_position / add
         if delta_dollars <= 0:
-            return _order_result(allocation, "rejected_already_at_target", limit_price=limit_price)
+            return _order_result(
+                allocation, "rejected_already_at_target", limit_price=limit_price,
+                detail=(f"holding {current_value:,.2f} already meets the "
+                        f"{target_weight:.2f}% target ({target_dollars:,.2f})"))
 
         # =========================================================
         # BUYING POWER (D2). get_account() has always returned this
@@ -321,10 +339,16 @@ def execute_allocation(today: date, allocation: Allocation,
         if shares <= 0 and clipped:
             return _order_result(
                 allocation, "rejected_insufficient_buying_power", limit_price=limit_price,
+                detail=(f"needed {target_dollars - current_value:,.2f}; buying power "
+                        f"{buying_power:,.2f} x {BUYING_POWER_SAFETY_MARGIN:.0%} = "
+                        f"{affordable:,.2f}, under one share at {limit_price:,.2f}"),
             )
 
     if shares <= 0:
-        return _order_result(allocation, "rejected_zero_shares", limit_price=limit_price)
+        return _order_result(
+            allocation, "rejected_zero_shares", limit_price=limit_price,
+            detail=(f"{target_weight:.2f}% of NAV {nav:,.2f} is {delta_dollars:,.2f} "
+                    f"to move, under one share at {limit_price:,.2f}"))
 
     # =============================================================
     # POST-TRADE ASSERTION — the last wall before money moves.
@@ -344,7 +368,10 @@ def execute_allocation(today: date, allocation: Allocation,
     if side == "buy":
         resulting_weight = (current_value + shares * limit_price) / nav * 100
         if resulting_weight > max_position_pct + 1e-9:
-            return _order_result(allocation, "rejected_post_trade_limit", limit_price=limit_price)
+            return _order_result(
+                allocation, "rejected_post_trade_limit", limit_price=limit_price,
+                detail=(f"resulting weight {resulting_weight:.2f}% would breach the "
+                        f"{max_position_pct:.2f}% cap, on {ledger.describe()}"))
 
         live_position = alpaca_client.get_position(allocation.ticker)
         if live_position:
@@ -363,6 +390,9 @@ def execute_allocation(today: date, allocation: Allocation,
                     )
                     return _order_result(
                         allocation, "rejected_live_drift_limit", limit_price=limit_price,
+                        detail=(f"ledger basis {resulting_weight:.2f}% passes but the "
+                                f"broker's live view is {live_resulting:.2f}% against a "
+                                f"{max_position_pct:.2f}% cap"),
                     )
 
     # =============================================================
@@ -381,13 +411,18 @@ def execute_allocation(today: date, allocation: Allocation,
     # system you don't trust shouldn't be picking exits either.
     # =============================================================
     if not is_trading_enabled():
-        return _order_result(allocation, "halted_by_operator", limit_price=limit_price)
+        return _order_result(allocation, "halted_by_operator", limit_price=limit_price,
+                             detail="kill switch flipped between sizing and submission")
 
     result = alpaca_client.submit_limit_order(allocation.ticker, side, shares, limit_price)
     return _order_result(
         allocation, result["status"],
         limit_price=limit_price, shares=shares,
         alpaca_order_id=result["alpaca_order_id"],
+        # The sizing basis, recorded on the order that used it. Otis
+        # will have moved the ledger on by the time anyone reads this.
+        detail=(f"{shares:g} @ {limit_price:,.2f} to reach {target_weight:.2f}%; "
+                f"sized from {ledger.describe()}"),
     )
 
 
@@ -409,8 +444,28 @@ def run(today: date) -> dict:
             )
             .all()
         )
+        # ONLY orders that actually reached the broker block a retry.
+        #
+        # This used to key on ANY order row for the ticker today, which
+        # meant a REFUSAL blocked its own retry — and silently, via the
+        # `continue` below, leaving no second row and no log line. It
+        # bit three times in three days: halted_by_operator, then
+        # rejected_zero_shares, then rejected_stale_ledger. Each time
+        # the fix was the same manual DELETE, and each time the desk
+        # looked like it had simply ignored a valid allocation.
+        #
+        # A row with no alpaca_order_id never reached the market, so
+        # there is nothing to be idempotent about. The guard exists to
+        # prevent a DUPLICATE REAL TRADE; it was preventing a retry.
+        #
+        # A retry adds a second row rather than replacing the first —
+        # deliberately. "Refused at 16:31, submitted at 16:44" is the
+        # history you want; overwriting it would lose the refusal.
         already_executed = {
-            o.ticker for o in session.query(Order).filter(Order.order_date == today).all()
+            o.ticker for o in session.query(Order).filter(
+                Order.order_date == today,
+                Order.alpaca_order_id.isnot(None),
+            ).all()
         }
         policy = get_active_risk_policy(session, today)
         max_position_pct = float(policy.max_position_pct)
@@ -442,7 +497,15 @@ def run(today: date) -> dict:
     # that was never going to trade. Every order still gets recorded,
     # so a halted day leaves a full record of what it would have done.
     halted = not is_trading_enabled()
+    halt_reason = ""
     if halted:
+        try:
+            _state = get_control_state()
+            halt_reason = f"{_state.changed_by}: {_state.reason}"
+        except Exception:  # noqa: BLE001
+            # The reason is a nicety; never let fetching it stop the
+            # recording of the halt itself.
+            halt_reason = "reason unavailable"
         logger.warning(
             "TRADING HALTED by operator — recording %d allocation(s) as "
             "halted_by_operator without submitting anything.", len(allocations),
@@ -454,11 +517,20 @@ def run(today: date) -> dict:
             continue  # already placed today — never resubmit
 
         if halted:
-            order = _order_result(allocation, "halted_by_operator")
+            order = _order_result(
+                allocation, "halted_by_operator",
+                detail=f"kill switch set — {halt_reason}")
         elif not ledger.usable_for_sizing:
-            order = _order_result(allocation, "rejected_stale_ledger")
+            order = _order_result(
+                allocation, "rejected_stale_ledger",
+                detail=(f"{ledger.describe()}; tolerance is "
+                        f"{MAX_LEDGER_STALENESS_SESSIONS} session(s). "
+                        f"Run `python -m agents.otis` to close the books."))
         elif breaker_active and allocation.action in ("new_position", "add"):
-            order = _order_result(allocation, "halted_circuit_breaker")
+            order = _order_result(
+                allocation, "halted_circuit_breaker",
+                detail="Nora's drawdown breaker is active — new risk frozen, "
+                       "reductions still permitted")
         else:
             order = execute_allocation(today, allocation, max_position_pct, ledger)
 

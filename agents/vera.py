@@ -39,10 +39,14 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+import logging
+
 from core.clients import fmp_client
 from core.clients.claude_client import run_agent_loop, extract_json
 from core.db import session_scope
 from core.models import Thesis, PositionMonitoringLog, NewCandidate, Position, RiskPolicyVersion, PositionPnlHistory
+
+logger = logging.getLogger(__name__)
 
 
 # =================================================================
@@ -442,6 +446,12 @@ def run(today: date, atlas_output: dict) -> dict:
     not a directive; the screening prompt explicitly says macro alone
     shouldn't drive a stock-specific call.
     """
+    # D7 — start the data-coverage count clean. Atlas runs before Vera
+    # in the cycle and shares this client, so without a reset his four
+    # index calls would be pooled into her ticker coverage and dilute
+    # the number Solomon gates on.
+    fmp_client.coverage.reset()
+
     with session_scope() as session:
         open_theses = get_open_theses(session)
         held_tickers = [t.ticker for t in open_theses]
@@ -583,10 +593,23 @@ def run(today: date, atlas_output: dict) -> dict:
 
     orphan_reviews = review_orphan_positions(today)
 
+    # D7 — how much of what she asked for she actually got. Carried in
+    # her output rather than logged, because the agent that has to act
+    # on it is Solomon, and a number he cannot see is a number he
+    # cannot weigh.
+    data_coverage = fmp_client.coverage.summary()
+    if data_coverage["requests_degraded"]:
+        logger.warning(
+            "Vera ran degraded: %s of %s tickers complete (%s%%). Degraded: %s",
+            data_coverage["tickers_complete"], data_coverage["tickers_attempted"],
+            data_coverage["coverage_pct"], data_coverage["degraded_tickers"],
+        )
+
     return {
         "monitoring": [m.model_dump() for m in monitoring_results],
         "candidates": [c.model_dump() for c in candidate_results],
         "orphan_reviews": orphan_reviews,
+        "data_coverage": data_coverage,
     }
 
 

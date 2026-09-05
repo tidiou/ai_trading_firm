@@ -240,6 +240,10 @@ class Order(Base):
     fill_price: Mapped[Optional[Decimal]]
     slippage_bps: Mapped[Optional[Decimal]]
     alpaca_order_id: Mapped[Optional[str]]
+    # Why this status, in words — see migration 007. A status is a
+    # verdict; a verdict with no evidence stops being explainable the
+    # moment the condition that caused it is repaired.
+    status_detail: Mapped[Optional[str]]
 
 
 # ============================================================
