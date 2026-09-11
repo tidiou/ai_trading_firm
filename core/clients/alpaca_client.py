@@ -7,12 +7,18 @@ Used by: Ada (execution), and later Otis (ground-truth reconciliation).
 """
 
 import os
+from datetime import date, datetime, time, timezone
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import LimitOrderRequest
+from alpaca.common.exceptions import APIError
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
+from alpaca.data.requests import (
+    StockBarsRequest, StockLatestQuoteRequest, StockLatestTradeRequest,
+)
+from alpaca.data.timeframe import TimeFrame
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,6 +26,13 @@ load_dotenv()
 ALPACA_API_KEY = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 ALPACA_PAPER = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
+
+# Which market-data feed historical bars come from. Defaults to IEX
+# because that is what the free Alpaca data plan serves — asking for
+# SIP on a free key returns HTTP 403 "subscription does not permit
+# querying recent SIP data" rather than degrading. Set to "sip" once
+# the data subscription is paid for.
+ALPACA_DATA_FEED = os.environ.get("ALPACA_DATA_FEED", "iex").lower()
 
 _trading_client = None
 _data_client = None
@@ -146,6 +159,79 @@ def get_latest_quote(ticker: str) -> dict:
         "bid": bid, "ask": ask, "mid": mid,
         "spread_pct": round(spread_pct, 3), "used_fallback_trade_price": False,
     }
+
+
+def get_daily_bars(ticker: str, start: date, end: date) -> list[dict]:
+    """
+    Daily closes for one symbol over a date range (D4).
+
+    A narrow accessor in the same spirit as get_buying_power(): the
+    caller gets the two fields it needs, not an Alpaca object graph, so
+    the SDK's shape stays behind this module.
+
+    HISTORICAL, NOT LIVE, AND THAT IS THE POINT. The benchmark is
+    backfillable — you can ask for bars from before the desk existed —
+    which is why D4 could be deferred without losing anything.
+
+    TWO REQUEST OPTIONS THAT ARE NOT COSMETIC:
+
+    `feed` — the free Alpaca data plan serves IEX and refuses recent
+    SIP outright ("subscription does not permit querying recent SIP
+    data", HTTP 403), which is what the first backfill hit. IEX is one
+    venue rather than the consolidated tape, so its daily close is the
+    last IEX print rather than the official closing auction — close but
+    not identical. For a multi-session RETURN comparison on a name as
+    liquid as SPY that difference is immaterial, and it is named here
+    rather than hidden. Set ALPACA_DATA_FEED=sip on a paid plan to get
+    the consolidated series instead.
+
+    `adjustment=ALL` — split AND dividend adjusted, which makes the
+    series a TOTAL-RETURN proxy. This one is a correctness fix, not a
+    nicety: the desk's NAV already includes dividends it received, so
+    comparing it against a price-only index would flatter the desk by
+    roughly the index's yield every year, quietly and in one direction.
+    A benchmark that is systematically 1.3% a year too low is exactly
+    the kind of silent bias the rest of this system exists to refuse.
+
+    Returns [{"date": date, "close": float}] ascending, empty on a
+    range containing no sessions. Bars come back timezone-aware; a US
+    equity daily bar is stamped at the session date, so the date part
+    is taken directly rather than converted.
+    """
+    request = StockBarsRequest(
+        symbol_or_symbols=ticker,
+        timeframe=TimeFrame.Day,
+        start=datetime.combine(start, time.min, tzinfo=timezone.utc),
+        end=datetime.combine(end, time.max, tzinfo=timezone.utc),
+        feed=DataFeed(ALPACA_DATA_FEED),
+        adjustment=Adjustment.ALL,
+    )
+
+    try:
+        bars = get_data_client().get_stock_bars(request)
+    except APIError as exc:
+        # The subscription errors are worth translating. Raw, this
+        # surfaces as a 403 with a message about SIP that says nothing
+        # about which knob to turn — the same reasoning as the FMP
+        # client distinguishing quota exhaustion from throttling.
+        message = str(exc)
+        if "subscription" in message.lower() or "sip" in message.lower():
+            raise RuntimeError(
+                f"Alpaca refused {ALPACA_DATA_FEED!r} market data for {ticker}: "
+                f"{message}. The free data plan serves the IEX feed only — set "
+                f"ALPACA_DATA_FEED=iex in .env (the default), or upgrade the "
+                f"Alpaca data subscription to use sip."
+            ) from exc
+        raise
+
+    rows = []
+    for bar in bars.data.get(ticker, []):
+        stamp = bar.timestamp
+        rows.append({
+            "date": stamp.date() if hasattr(stamp, "date") else stamp,
+            "close": float(bar.close),
+        })
+    return sorted(rows, key=lambda r: r["date"])
 
 
 def cancel_order(order_id: str) -> dict:

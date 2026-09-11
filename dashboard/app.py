@@ -49,7 +49,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from core.db import engine
-from core.market_calendar import EASTERN, NYSE, market_is_open_now
+from core.benchmark import BENCHMARK_TICKER, compute_performance
+from core.cycle_schedule import GROUP_ORDER, PHASE_GROUPS, cycle_row_name, is_cycle_row
+from core.market_calendar import EASTERN, NYSE, is_trading_day, market_is_open_now
 
 BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -63,22 +65,61 @@ st.set_page_config(page_title="MBY-Trading", layout="wide", page_icon="🕰️")
 # what they mean rather than for the colour, because the point of
 # oxblood here is "a number you do not want to see", not "red".
 # =================================================================
+# Measured, not eyeballed. The first cut of this palette put the metric
+# labels at 2.5:1 against the card and the discrepancy alert at 2.2:1 —
+# so the least readable thing on the Floor was the one shouting for
+# attention. Every value below now clears 4.5:1 (WCAG AA) against the
+# surface it actually sits on, checked with the standard relative-
+# luminance formula rather than by looking at it in a bright room.
+#
+# The surfaces also had to separate. A card at #232019 on a floor at
+# #1A1815 is 1.09:1 — mathematically a different colour and visually
+# the same one. The card now sits a real step above the floor, and the
+# old card colour became the STOOD-DOWN card, which keeps that state
+# dimmer than an active one without making it unreadable.
+#
+# SECOND PASS — the card came up two more steps (#302B24 → #38322A,
+# 1.26:1 → 1.40:1 against the floor), and raising a background costs
+# light text contrast, so every text colour was lifted with it. The
+# lift is UNIFORM (+0.05 lightness, hue and saturation untouched) so
+# the palette keeps its internal relationships rather than each colour
+# being solved on its own and the hierarchy flattening: muted and faint
+# would have converged to within one step of each other.
+#
+#   text                on card   on hover   role
+#   ink       #FAF8F4    11.9:1    11.1:1    values, names
+#   muted     #B1A898     5.4:1     5.0:1    role lines, secondary prose
+#   faint     #AEA591     5.2:1     4.8:1    metric labels
+#   brass     #D7B032     6.1:1     5.7:1    desk headings, accents
+#   green     #8BB489     5.4:1     5.0:1    within-limits, healthy
+#   amber     #D8983C     5.1:1     4.7:1    working, warning
+#   ox        #DD8C83     4.9:1     4.6:1    breach, discrepancy
+#
+# Hover is checked too because .mby-cardlink:hover swaps the card to
+# `panel2` — a state where every one of those pairs still has to hold,
+# and the binding constraint on how far apart the two surfaces can sit.
+#
+# `rule` also had to come up: the old #3A342A was 1.03:1 against the
+# brighter card, i.e. the card border had disappeared into the card.
+#
+# The alert colours had to get LIGHTER to become readable, which is the
+# opposite of the instinct on paper and correct on a dark ground.
 C = {
-    "ground": "#1A1815",
-    "panel": "#232019",
-    "panel2": "#2C2820",
-    "sunk": "#1E1B16",
+    "ground": "#1A1815",     # the Floor
+    "panel": "#38322A",      # an active card — two steps up from #302B24
+    "panel2": "#3E372D",     # hover, avatar wells
+    "sunk": "#2B2620",       # stood down: dimmer than active, still legible
     "tape": "#16140F",
-    "rule": "#3A342A",
-    "rule_strong": "#4A4235",
-    "ink": "#F2EDE3",
-    "muted": "#A69C89",
-    "faint": "#6F6656",
-    "brass": "#C9A227",
-    "brass_dim": "#8A6F1C",
-    "green": "#6E9C6B",
-    "amber": "#D08C2A",
-    "oxblood": "#A63A2E",
+    "rule": "#4A4235",
+    "rule_strong": "#574E3F",
+    "ink": "#FAF8F4",
+    "muted": "#B1A898",
+    "faint": "#AEA591",
+    "brass": "#D7B032",
+    "brass_dim": "#9F8020",
+    "green": "#8BB489",
+    "amber": "#D8983C",
+    "oxblood": "#DD8C83",
 }
 
 FONTS = ("https://fonts.googleapis.com/css2?"
@@ -761,13 +802,26 @@ PAGE_CSS = """
   .mby-role { font-size: 12.5px; color: """ + C["muted"] + """; }
   .mby-card.down .mby-role { color: """ + C["faint"] + """; }
   .mby-met { display: flex; align-items: baseline; justify-content: space-between; }
-  .mby-met.first { border-top: 1px solid """ + C["panel2"] + """; padding-top: 9px; }
-  .mby-met .k { font-size: 12px; color: """ + C["faint"] + """; }
+  /* On the brighter card, panel2 is 1.08:1 — an invisible rule. The
+     separator above the metrics block uses `rule` (1.28:1) so the two
+     halves of the card still read as two halves. */
+  .mby-met.first { border-top: 1px solid """ + C["rule"] + """; padding-top: 9px; }
+  .mby-met .k { font-size: 12.5px; color: """ + C["faint"] + """; }
   .mby-met .v { font-family: 'JetBrains Mono', monospace; font-size: 13px;
     font-variant-numeric: tabular-nums; color: """ + C["ink"] + """; }
   .mby-open { font-family: 'JetBrains Mono', monospace; font-size: 9.5px;
     letter-spacing: 0.14em; color: """ + C["rule_strong"] + """; text-align: right; }
   .mby-cardlink:hover .mby-open { color: """ + C["brass"] + """; }
+
+  /* --- the scheduled runs ---------------------------------- */
+  .mby-sched { display: flex; align-items: center; flex-wrap: wrap; gap: 18px;
+    padding: 9px 28px; background: """ + C["sunk"] + """;
+    border-bottom: 1px solid """ + C["rule"] + """; }
+  .mby-sched-chip { font-family: 'JetBrains Mono', monospace; font-size: 11px;
+    letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; }
+  .mby-sched-chip i { font-style: normal; color: """ + C["faint"] + """;
+    letter-spacing: .04em; text-transform: none; margin-left: 7px; }
+  .mby-sched-note { margin-left: auto; font-size: 11.5px; text-align: right; }
 
   /* --- the tape -------------------------------------------- */
   .mby-tape { border-top: 1px solid """ + C["rule"] + """;
@@ -921,9 +975,22 @@ class Desk:
     """Every figure the Floor and the dossiers show, loaded once."""
 
     def __init__(self):
-        self.runs_today = load(
+        all_runs_today = load(
             "SELECT agent_name, phase, status, started_at, completed_at "
             "FROM agent_runs WHERE run_date = %s", (et_today,))
+        # The cycle rows (`cycle:premarket` and friends) share this
+        # table with the agents but are not agents — they record that a
+        # scheduled GROUP ran. Counting them among the eight would turn
+        # "6 of 9 completed" into "6 of 12" and put three phantom lamps
+        # on the Floor, so they are split out here and read separately
+        # by the overdue banner.
+        if all_runs_today.empty:
+            self.runs_today = all_runs_today
+            self.cycle_runs = all_runs_today
+        else:
+            mask = all_runs_today["agent_name"].map(is_cycle_row)
+            self.runs_today = all_runs_today[~mask].reset_index(drop=True)
+            self.cycle_runs = all_runs_today[mask].reset_index(drop=True)
         self.macro = one("SELECT regime_signal, change_from_yesterday, confidence, "
                          "narrative, brief_date FROM macro_briefs "
                          "ORDER BY brief_date DESC LIMIT 1")
@@ -958,6 +1025,16 @@ class Desk:
         self.last_report = one("SELECT report_date FROM daily_reports "
                                "ORDER BY report_date DESC LIMIT 1")
 
+        # D4 — the two series the headline comparison needs, plus the
+        # book they are weighted by.
+        self.pnl_series = load("SELECT pnl_date, nav FROM daily_pnl "
+                               "WHERE nav IS NOT NULL ORDER BY pnl_date")
+        self.benchmark_series = load(
+            "SELECT bar_date, close FROM benchmark_history "
+            "WHERE ticker = %s ORDER BY bar_date", (BENCHMARK_TICKER,))
+        self.positions_now = load("SELECT market_value FROM positions")
+        self.performance = self._compute_performance()
+
         terminal = {"filled", "expired_unfilled", "canceled", "cancelled", "rejected"}
         if self.orders_today.empty:
             self.working_n = 0
@@ -965,6 +1042,88 @@ class Desk:
             reached = self.orders_today["alpaca_order_id"].notna()
             self.working_n = int(
                 (reached & ~self.orders_today["status"].isin(terminal)).sum())
+
+    def _compute_performance(self) -> dict:
+        """
+        The desk against the index (D4).
+
+        Computed from frames this class already loaded, through the
+        PURE function in core.benchmark, rather than by calling its
+        database-backed entry point. Two reasons: this page keeps a
+        single read path, and the arithmetic that produces the headline
+        number here is the same code the tests exercise, not a second
+        implementation that could drift from it.
+        """
+        navs = self.pnl_series
+        bench = self.benchmark_series
+        nav_series = ([] if navs.empty else
+                      [(r.pnl_date, float(r.nav)) for r in navs.itertuples()
+                       if r.nav is not None and pd.notna(r.nav)])
+        bench_map = ({} if bench.empty else
+                     {r.bar_date: float(r.close) for r in bench.itertuples()})
+
+        weights = None
+        if nav_series:
+            invested = 0.0 if self.positions_now.empty else float(
+                self.positions_now["market_value"].fillna(0).sum())
+            latest_nav = nav_series[-1][1]
+            if latest_nav:
+                weights = [min(invested / latest_nav, 1.0)] * len(nav_series)
+
+        result = compute_performance(nav_series, bench_map, weights)
+        return {
+            "benchmark": BENCHMARK_TICKER,
+            "measurable": result.measurable,
+            "unavailable": result.unavailable,
+            "summary": result.describe(),
+            "sessions": result.sessions,
+            "desk_return_pct": result.desk_return_pct,
+            "benchmark_return_pct": result.benchmark_return_pct,
+            "active_return_pct": result.active_return_pct,
+            "selection_pct": result.selection_pct,
+            "cash_drag_pct": result.cash_drag_pct,
+            "avg_invested_pct": result.avg_invested_pct,
+            "tracking_error_pct": result.tracking_error_pct,
+        }
+
+    def schedule(self) -> list[dict]:
+        """
+        The state of today's three scheduled runs.
+
+        THE FAILURE MODE THIS EXISTS FOR is the only one that leaves no
+        trace anywhere else on this page: the run that never fired. A
+        crashed agent writes a `failed` row and shows a red lamp; a
+        laptop asleep at 09:45 writes nothing at all, and every panel
+        here looks exactly like a quiet day on which Solomon saw no
+        reason to act. Absence is only visible against an expectation,
+        so the expectation — core.cycle_schedule — is read here and
+        compared against what is on the record.
+        """
+        trading = is_trading_day(et_today)
+        now_t = et_now.time()
+        out = []
+        for key in GROUP_ORDER:
+            spec = PHASE_GROUPS[key]
+            state = "not_run"
+            if trading and not self.cycle_runs.empty:
+                row = self.cycle_runs[
+                    self.cycle_runs["agent_name"] == cycle_row_name(key)]
+                if not row.empty:
+                    state = str(row.iloc[0]["status"])
+            out.append({
+                "key": key,
+                "label": spec.label,
+                "phases": spec.phases,
+                "state": "n/a" if not trading else state,
+                "due_by": spec.due_by.strftime("%H:%M"),
+                # `running` counts as overdue once its hour is long past:
+                # a group stuck in `running` never wrote a completion, and
+                # a process that died mid-flight leaves exactly that row.
+                "overdue": bool(trading
+                                and state in ("not_run", "failed", "running")
+                                and now_t > spec.due_by),
+            })
+        return out
 
     def status(self, keys: list[str]) -> tuple[str, str]:
         """(lamp colour, plain-language state) for one agent today.
@@ -1142,6 +1301,50 @@ def tape(desk: Desk) -> str:
     return ' <span class="sep">|</span> '.join(items[:5])
 
 
+def schedule_strip(desk: Desk) -> str:
+    """
+    The three scheduled runs and whether they happened.
+
+    Placed above the phase rail deliberately. The rail answers "how far
+    did today's cycle get"; this answers the prior question, "did today's
+    cycle start at all" — and on an unattended desk that is the one you
+    need first. It says nothing at all on a day with nothing to say.
+    """
+    rows = desk.schedule()
+    if not any(r["state"] != "n/a" for r in rows):
+        return ""  # not an NYSE trading day — there is nothing to be late for
+
+    chips = ""
+    for r in rows:
+        if r["overdue"]:
+            col, mark = C["oxblood"], "&#9679;"
+        elif r["state"] == "completed":
+            col, mark = C["green"], "&#10003;"
+        elif r["state"] == "running":
+            col, mark = C["amber"], "&#9679;"
+        elif r["state"] == "failed":
+            col, mark = C["oxblood"], "&#10007;"
+        else:
+            col, mark = C["faint"], "&#9675;"   # not run, not yet due
+        chips += (f'<span class="mby-sched-chip" style="color:{col}">'
+                  f'{mark} {esc(r["key"])}'
+                  f'<i>{esc(r["state"].replace("_", " "))}</i></span>')
+
+    late = [r for r in rows if r["overdue"]]
+    if late:
+        names = ", ".join(r["key"] for r in late)
+        note = (f'<span class="mby-sched-note" style="color:{C["oxblood"]}">'
+                f'{esc(names)} did not run — check '
+                f'<span class="mby-mono">logs/</span> and '
+                f'<span class="mby-mono">launchctl list | grep com.mby</span>'
+                f'</span>')
+    else:
+        note = (f'<span class="mby-sched-note" style="color:{C["faint"]}">'
+                f'scheduled runs, Eastern</span>')
+
+    return f'<div class="mby-sched">{chips}{note}</div>'
+
+
 def page_floor(desk: Desk) -> None:
     desks_html = ""
     for key, desk_label in DESKS:
@@ -1199,6 +1402,7 @@ def page_floor(desk: Desk) -> None:
       <span style="color:{cycle_col}">{done} of {total} completed</span>
     </div>
   </div>
+  {schedule_strip(desk)}
   <div class="mby-rail">{phase_rail(desk)}</div>
   <div class="mby-desks">{desks_html}</div>
   <div class="mby-tape">
@@ -2000,6 +2204,53 @@ def page_execution(desk: Desk) -> None:
 
 
 def page_portfolio(desk: Desk) -> None:
+    # =============================================================
+    # THE HEADLINE, ABOVE EVERYTHING ELSE (D4).
+    #
+    # Absolute P&L used to be the only performance figure on this page,
+    # and a page whose first number is absolute return teaches its
+    # reader to ask the wrong question. A desk up 4% in a month the
+    # index rose 6% lost money in the only sense that matters.
+    #
+    # The gap is split because on this book it would otherwise mislead
+    # in a predictable direction: a mostly-cash portfolio trails any
+    # rising index, and that says nothing about the picking. "We held
+    # cash" and "our picks were bad" need different answers.
+    # =============================================================
+    perf = desk.performance
+    st.subheader(f"Performance vs {perf['benchmark']}")
+    if not perf["measurable"]:
+        st.info(f"No comparison available — {perf['unavailable']}")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Desk", f"{perf['desk_return_pct']:+.2f}%")
+        c2.metric(perf["benchmark"], f"{perf['benchmark_return_pct']:+.2f}%")
+        c3.metric("Active", f"{perf['active_return_pct']:+.2f}pp",
+                  delta=f"{perf['active_return_pct']:+.2f}")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Selection", f"{perf['selection_pct']:+.2f}pp",
+                  help="The desk's return net of what its exposure to the index "
+                       "would have produced anyway. This is the stock-picking.")
+        c5.metric("Cash drag", f"{perf['cash_drag_pct']:+.2f}pp",
+                  help="What being under-invested cost. NEGATIVE means cash "
+                       "helped — the index fell and the desk was not fully in it.")
+        c6.metric("Avg invested", f"{perf['avg_invested_pct']:.1f}%",
+                  help="Approximated from today's book held flat across the "
+                       "period: positions is rebuilt each close rather than kept "
+                       "as a history, so there is no per-session weight to read.")
+
+        st.caption(
+            f"{perf['summary']}  \n"
+            f"selection − cash drag = active return, exactly. "
+            + ("Tracking error is withheld until there are enough sessions to "
+               "compute it without inventing precision."
+               if perf["tracking_error_pct"] is None
+               else f"Tracking error {perf['tracking_error_pct']:.2f}%.")
+            + " And a caution the arithmetic cannot carry: a handful of names held "
+              "for weeks to months makes perhaps ten to thirty decisions a year, so "
+              "this is a measurement, not yet evidence of skill.")
+
     st.subheader("Open Discrepancies (Otis)")
     st.caption(
         "Never auto-resolved — flagged here for human review. Each one describes the "

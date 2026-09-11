@@ -76,8 +76,11 @@ import logging
 
 from sqlalchemy import func
 
+from core.benchmark import sync_to_date
 from core.clients import alpaca_client
-from core.market_calendar import market_is_open_now
+from core.market_calendar import (
+    EASTERN, market_is_open_now, order_session_close, order_session_is_over,
+)
 from core.clients.claude_client import run_agent_loop, extract_json
 from core.db import session_scope
 from core.models import (
@@ -228,6 +231,55 @@ TERMINAL_ORDER_STATUSES = {
 }
 
 
+def _order_is_still_live(order: Order) -> bool:
+    """An order that reached the broker, has not reached a terminal
+    state, and whose session has not closed yet. Since D10 that is a
+    legitimate resting state rather than something to flag."""
+    return (
+        order.alpaca_order_id is not None
+        and order.status not in TERMINAL_ORDER_STATUSES
+        and order.recorded_at is not None
+        and not order_session_is_over(order.recorded_at)
+    )
+
+
+def _order_may_be_swept(order: Order) -> tuple[bool, str]:
+    """
+    May this order be cancelled as an unfilled day order?
+
+    Returns (verdict, reason) — the reason is logged when the answer is
+    no, because "Otis ran and cancelled nothing" and "Otis ran and left
+    a live order out overnight" must not look the same in the log.
+
+    Three cases:
+
+      1. `recorded_at` known and its session has closed — sweep it. The
+         order had its day and did not fill.
+
+      2. `recorded_at` known and its session has NOT closed — leave it.
+         Either it is trading right now, or it is queued for a bell that
+         has not rung. This is the case D10 was about.
+
+      3. `recorded_at` NULL (a row written before migration 008) — fall
+         back to the old rule: stand down while the session is open,
+         sweep otherwise. We do not know when this one was placed and
+         will not invent a time for it. The fallback is what the desk
+         did for its whole life until now, so this is not a new risk,
+         and the set of such rows is fixed and shrinking.
+    """
+    if order.recorded_at is None:
+        if market_is_open_now():
+            return False, "placed before migration 008, session still open"
+        return True, ""
+
+    if not order_session_is_over(order.recorded_at):
+        close = order_session_close(order.recorded_at)
+        when = close.astimezone(EASTERN).strftime("%a %d %b %H:%M ET") if close else "unknown"
+        return False, f"its session closes {when}"
+
+    return True, ""
+
+
 def _sweep_unfilled_orders(session, today: date, booked_ids: set) -> tuple[list[dict], list[Order]]:
     """
     End-of-day sweep (D3). Cancels today's orders that never filled and
@@ -247,32 +299,50 @@ def _sweep_unfilled_orders(session, today: date, booked_ids: set) -> tuple[list[
     again. What was missing was the record that today's attempt failed
     and why.
 
-    THE GUARD MATTERS. The sweep stands down while the session is open.
-    Otis normally runs after the close, but running him mid-session to
-    look at the books would otherwise cancel orders still perfectly
-    capable of filling — an inspection command with a destructive side
-    effect, which is a bad thing to leave lying around.
+    THE GUARD MATTERS, AND IT USED TO ASK THE WRONG QUESTION (D10).
+
+    It asked `market_is_open_now()`. That protects an order placed
+    DURING a session from an inspection run — which is real, and worth
+    keeping. What it does not protect is an order placed OUTSIDE one,
+    and on the schedule this desk was built for that was every order it
+    would ever place: the cycle ran at 16:30 ET, Ada submitted a DAY
+    limit that the broker queued for the next open, and Otis swept it
+    ninety seconds later with the market shut and the guard satisfied.
+    The order was cancelled before it had seen a second of trading and
+    recorded as `expired_unfilled` — indistinguishable, on the row,
+    from a limit the market never came near.
+
+    It never fired only because no cycle had yet placed an order.
+
+    So the guard is now per-order and asks what it actually means:
+    HAS THE SESSION THIS ORDER WAS QUEUED FOR CLOSED? An order placed
+    at 09:45 is swept after that day's close; one placed at 16:30 on a
+    Friday before a Monday holiday is not touched until Tuesday's
+    close. `order_session_is_over` does that arithmetic against the real
+    NYSE calendar, early closes included.
+
+    Rows written before migration 008 have no `recorded_at` and cannot
+    answer the question. They keep the old whole-sweep behaviour rather
+    than being guessed at — see `_order_may_be_swept`.
 
     Cancelling can also lose a race: an order may fill between the
     status read and the cancel. Those come back as filled and are
     returned for booking rather than treated as an error.
     """
-    if market_is_open_now():
-        logger.info(
-            "Sweep skipped — the NYSE session is still open. Unfilled orders are "
-            "left live; run Otis after the close to sweep them."
-        )
-        return [], []
-
     candidates = (
         session.query(Order)
         .filter(Order.order_date == today, Order.alpaca_order_id.isnot(None))
         .all()
     )
 
-    expired, filled_during_cancel = [], []
+    expired, filled_during_cancel, held_back = [], [], []
     for order in candidates:
         if order.status in TERMINAL_ORDER_STATUSES or order.alpaca_order_id in booked_ids:
+            continue
+
+        may_sweep, why = _order_may_be_swept(order)
+        if not may_sweep:
+            held_back.append(f"{order.ticker} ({why})")
             continue
 
         outcome = alpaca_client.cancel_order(order.alpaca_order_id)
@@ -306,6 +376,14 @@ def _sweep_unfilled_orders(session, today: date, booked_ids: set) -> tuple[list[
         logger.warning(
             "%d order(s) expired unfilled and were cancelled: %s",
             len(expired), ", ".join(e["ticker"] for e in expired),
+        )
+    if held_back:
+        # Said out loud, every time. An order left live overnight is a
+        # position the desk may wake up holding, and the one thing worse
+        # than sweeping too early is doing nothing quietly.
+        logger.info(
+            "%d order(s) left live — their session has not closed yet: %s",
+            len(held_back), ", ".join(held_back),
         )
 
     return expired, filled_during_cancel
@@ -411,6 +489,23 @@ def _detect_discrepancies(session, today: date, alpaca_positions: list[dict]) ->
                     f"placed and cancelled unfilled at the close. Not an error — the market "
                     f"did not reach the limit. Tomorrow's cycle will re-decide."
                 )
+            elif attempted is not None and _order_is_still_live(attempted):
+                # NOT a discrepancy, and saying it is would be worse than
+                # useless. Since D10 the sweep leaves an order alone until
+                # the session it was queued for has closed — so an order
+                # placed outside session hours is legitimately unresolved
+                # at this moment. Flagging it would teach the reader that
+                # the discrepancy list contains routine states, which is
+                # how a control stops being read.
+                close = order_session_close(attempted.recorded_at)
+                when = (close.astimezone(EASTERN).strftime("%a %d %b %H:%M ET")
+                        if close else "its next session")
+                continue_note = (
+                    f"{alloc.ticker}: order live at {attempted.limit_price}, "
+                    f"awaiting the session closing {when}"
+                )
+                logger.info("Not a discrepancy — %s", continue_note)
+                continue
             elif attempted is not None:
                 actual = f"order recorded with status '{attempted.status}'"
                 description = (
@@ -613,9 +708,24 @@ def run(today: date) -> dict:
         )
         narrative = ReconciliationNarrative.model_validate(extract_json(raw)).narrative
 
+    # ---- keep the benchmark series current (D4) ----
+    #
+    # Otis's job, because he already owns the ledger and already talks
+    # to the market at the close. GUARDED: a failed index fetch must
+    # never stop the books closing. The series is backfillable, so a
+    # missed day costs nothing that cannot be recovered — which is
+    # exactly the argument for not letting it fail a reconciliation.
+    benchmark_bars = 0
+    try:
+        benchmark_bars = sync_to_date(today)
+    except Exception as exc:  # noqa: BLE001 — see comment above
+        logger.warning("Benchmark sync failed (%s). Books still closed; "
+                       "run `python -m core.benchmark backfill` to catch up.", exc)
+
     return {
         "date": today,
         "reconciled": len(discrepancies) == 0,
+        "benchmark_bars_synced": benchmark_bars,
         "positions": alpaca_positions,
         "cash_balance": account["cash"],
         "nav": round(account["equity"], 2),

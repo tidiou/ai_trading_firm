@@ -240,29 +240,51 @@ def test_dates_and_decimals_serialise():
 
 
 # ===============================================================
-# D8 — the cycle survives a bad day
+# D8 / D10 — the cycle survives a bad day, now that it is three runs
+#
+# These three properties predate the split and survive it unchanged;
+# only the shape they are asserted against moved. The split makes the
+# first of them structural rather than merely careful: the close run is
+# a separate process that does not know whether the morning ran.
 # ===============================================================
-def test_phase_5_runs_even_when_the_trading_path_dies(monkeypatch):
+@contextmanager
+def _fake_track(_d, name, _p, called=None):
+    if called is not None:
+        called.append(name)
+    yield type("R", (), {"output": None})()
+
+
+def _stub_orchestrator(monkeypatch, orchestrator, called=None):
+    """Everything the runner touches outside the agents themselves:
+    the calendar, the kill switch, the run ledger, and the two DB reads
+    the split introduced."""
+    monkeypatch.setattr(orchestrator, "is_trading_day", lambda d: True)
+    monkeypatch.setattr(orchestrator, "get_trading_control_state",
+                        lambda: type("S", (), {"trading_enabled": True,
+                                               "describe": lambda self: "ENABLED"})())
+    monkeypatch.setattr(orchestrator, "track_agent_run",
+                        lambda d, name, p: _fake_track(d, name, p, called))
+    # The group rows are written directly rather than through
+    # track_agent_run — see TestRetryCounter in test_orchestrator.py.
+    monkeypatch.setattr(orchestrator, "log_agent_run",
+                        lambda *a, **k: None)
+    # `_attempts_so_far` and the execution gate both read agent_runs;
+    # the counter passes require_completed=False, so the stub has to
+    # accept it.
+    monkeypatch.setattr(orchestrator, "load_agent_output",
+                        lambda d, name, require_completed=True: None)
+
+
+def test_the_books_close_even_when_the_morning_dies(monkeypatch):
     """
-    The property that matters: a Phase 1 failure used to take Otis and
+    THE PROPERTY THAT MATTERS. A Phase 1 failure used to take Otis and
     Clara with it, so on exactly the days something went wrong the books
     never closed and no report was written.
     """
     import orchestrator
 
     called = []
-
-    monkeypatch.setattr(orchestrator, "is_trading_day", lambda d: True)
-    monkeypatch.setattr(orchestrator, "get_trading_control_state",
-                        lambda: type("S", (), {"trading_enabled": True,
-                                               "describe": lambda self: "ENABLED"})())
-
-    @contextmanager
-    def fake_track(_d, name, _p):
-        called.append(name)
-        yield type("R", (), {"output": None})()
-
-    monkeypatch.setattr(orchestrator, "track_agent_run", fake_track)
+    _stub_orchestrator(monkeypatch, orchestrator, called)
 
     def boom(*_a, **_k):
         raise RuntimeError("FMP quota exhausted")
@@ -280,32 +302,20 @@ def test_phase_5_runs_even_when_the_trading_path_dies(monkeypatch):
     monkeypatch.setattr(orchestrator.clara, "compile_daily_report",
                         lambda d: {"full_report_md": "# Report"})
 
-    result = orchestrator.run_daily_cycle()
+    result = orchestrator.run_daily_cycle(date(2026, 9, 8))
 
-    assert "trading_path" in result["errors"], "the failure must be recorded"
-    assert result["otis"] is not None, "the books must still close"
-    assert result["nora_monitor"] is not None, "risk must still run on the book"
-    assert result["clara"] is not None, "the report must still be written"
+    assert "premarket" in result["errors"], "the failure must be recorded"
+    close = result["groups"]["close"]
+    assert close["otis"] is not None, "the books must still close"
+    assert close["nora_monitor"] is not None, "risk must still run on the book"
+    assert close["clara"] is not None, "the report must still be written"
     assert "atlas" in called and "otis" in called
 
 
-def test_one_phase_5_failure_does_not_stop_the_others(monkeypatch):
+def test_one_close_failure_does_not_stop_the_others(monkeypatch):
     import orchestrator
 
-    monkeypatch.setattr(orchestrator, "is_trading_day", lambda d: True)
-    monkeypatch.setattr(orchestrator, "get_trading_control_state",
-                        lambda: type("S", (), {"trading_enabled": True,
-                                               "describe": lambda self: "ENABLED"})())
-
-    @contextmanager
-    def fake_track(_d, name, _p):
-        yield type("R", (), {"output": None})()
-
-    monkeypatch.setattr(orchestrator, "track_agent_run", fake_track)
-    monkeypatch.setattr(orchestrator.atlas, "run", lambda d: {
-        "regime_signal": "neutral", "change_from_yesterday": "none"})
-    monkeypatch.setattr(orchestrator.vera, "run", lambda d, a: {"candidates": [], "monitoring": []})
-    monkeypatch.setattr(orchestrator.solomon, "run", lambda d, a, v: {"action_needed": False})
+    _stub_orchestrator(monkeypatch, orchestrator)
 
     def otis_boom(_d):
         raise RuntimeError("Alpaca unreachable")
@@ -319,7 +329,7 @@ def test_one_phase_5_failure_does_not_stop_the_others(monkeypatch):
     monkeypatch.setattr(orchestrator.clara, "compile_daily_report",
                         lambda d: {"full_report_md": "# Report"})
 
-    result = orchestrator.run_daily_cycle()
+    result = orchestrator.run_group("close", date(2026, 9, 8))
 
     assert "otis" in result["errors"]
     assert result["otis"] is None
@@ -330,14 +340,19 @@ def test_one_phase_5_failure_does_not_stop_the_others(monkeypatch):
 def test_noras_two_passes_log_under_different_names():
     """
     agent_runs is unique on (run_date, agent_name). Logging both of
-    Nora's jobs as "nora" would have the Phase 5 monitor silently
-    overwrite the Phase 3 review — quiet data loss in the table that
-    exists to prevent exactly that.
+    Nora's jobs as "nora" would have the close monitor silently
+    overwrite the morning review — quiet data loss in the table that
+    exists to prevent exactly that. The split put the two passes in
+    different processes, which makes the collision less likely to be
+    noticed, not less likely to happen.
     """
     import inspect
     import orchestrator
 
-    src = inspect.getsource(orchestrator.run_daily_cycle)
-    assert '"nora_review"' in src
-    assert '"nora_monitor"' in src
-    assert 'track_agent_run(today, "nora",' not in src
+    review = inspect.getsource(orchestrator.run_execution)
+    close = inspect.getsource(orchestrator.run_close)
+
+    assert '"nora_review"' in review
+    assert '"nora_monitor"' in close
+    for src in (review, close):
+        assert 'track_agent_run(today, "nora",' not in src

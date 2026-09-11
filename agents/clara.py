@@ -49,6 +49,7 @@ from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.clients.claude_client import run_agent_loop, extract_json
+from core.benchmark import BENCHMARK_TICKER, performance_since_inception
 from core.db import session_scope
 from core.models import (
     Order, Allocation, ProposalReview, Proposal, StrategyDecision,
@@ -137,6 +138,38 @@ def audit_process_chain(session, today: date) -> tuple[str, list[dict]]:
 # =================================================================
 # PURE CODE — attribution. Numbers computed here, never by Claude.
 # =================================================================
+def compute_performance(today: date) -> dict:
+    """
+    The desk against the index (D4). Its own function so the headline
+    figure is computed in code and merely narrated by Claude, like
+    every other number Clara reports.
+
+    WHY THIS IS THE HEADLINE AND ABSOLUTE P&L IS NOT. A desk that
+    returned 4% in a month the index returned 6% lost money in the only
+    sense that matters. Reporting the 4% as a good month is not a
+    rounding error in the reporting, it is the wrong question answered
+    confidently — and it was what this agent did until now.
+
+    Returns a dict rather than the dataclass so it serialises straight
+    into agent_runs.raw_output alongside everything else.
+    """
+    result = performance_since_inception(today)
+    return {
+        "measurable": result.measurable,
+        "unavailable": result.unavailable,
+        "summary": result.describe(),
+        "sessions": result.sessions,
+        "desk_return_pct": result.desk_return_pct,
+        "benchmark": BENCHMARK_TICKER,
+        "benchmark_return_pct": result.benchmark_return_pct,
+        "active_return_pct": result.active_return_pct,
+        "selection_pct": result.selection_pct,
+        "cash_drag_pct": result.cash_drag_pct,
+        "avg_invested_pct": result.avg_invested_pct,
+        "tracking_error_pct": result.tracking_error_pct,
+    }
+
+
 def compute_attribution(session, today: date) -> list[dict]:
     positions = session.query(Position).all()
     pnl_row = session.query(DailyPnl).filter(DailyPnl.pnl_date == today).first()
@@ -170,9 +203,14 @@ def run(today: date) -> dict:
             "total": float(pnl_row.total_pnl) if pnl_row else 0.0,
         } if pnl_row else {"realized": 0.0, "unrealized": 0.0, "total": 0.0}
 
+    # Outside the session above: it opens its own, and holding two
+    # would nest them for no reason.
+    performance = compute_performance(today)
+
     narrative = "No trades today and nothing to attribute — a quiet, clean day."
     if attribution or violations:
         summary = (
+            f"Performance vs {performance['benchmark']}: {performance['summary']}\n"
             f"Daily P&L: {daily_pnl}\nAttribution: {attribution}\n"
             f"Process check: {process_check}\nViolations: {violations or 'none'}"
         )
@@ -200,7 +238,11 @@ def run(today: date) -> dict:
         session.execute(stmt)
 
     return {
-        "date": today, "daily_pnl": daily_pnl, "attribution": attribution,
+        "date": today,
+        # First in the dict on purpose — it is the headline, and
+        # absolute P&L below it is the secondary figure.
+        "performance": performance,
+        "daily_pnl": daily_pnl, "attribution": attribution,
         "process_check": process_check, "violations": violations, "narrative": narrative,
     }
 
@@ -236,8 +278,15 @@ def compile_daily_report(today: date) -> dict:
     clara_result = run(today)
     sections["OTIS/CLARA (Ops & Performance)"] = clara_result["narrative"]
 
-    report_body = f"# Daily Report — {today}\n\n" + "\n\n".join(
-        f"## {name}\n{content}" for name, content in sections.items()
+    # The comparison leads the report, above every agent's narrative
+    # (D4). A closing report whose first number is absolute P&L trains
+    # its reader to ask the wrong question — the desk's return only
+    # means something next to the return of doing nothing instead.
+    report_body = (
+        f"# Daily Report — {today}\n\n"
+        f"## PERFORMANCE vs {clara_result['performance']['benchmark']}\n"
+        f"{clara_result['performance']['summary']}\n\n"
+        + "\n\n".join(f"## {name}\n{content}" for name, content in sections.items())
     )
 
     exec_prompt = "Summarize this day at MBY-Trading in 2-3 sentences for a CEO skimming quickly:\n\n" + report_body

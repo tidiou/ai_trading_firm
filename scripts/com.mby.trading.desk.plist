@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  =====================================================================
+  launchd agent for MBY-Trading.
+
+  INSTALL
+
+    1. Edit the two paths marked EDIT ME below to your project folder.
+    2. cp scripts/com.mby.trading.desk.plist ~/Library/LaunchAgents/
+    3. launchctl unload ~/Library/LaunchAgents/com.mby.trading.desk.plist 2>/dev/null
+       launchctl load  ~/Library/LaunchAgents/com.mby.trading.desk.plist
+    4. launchctl list | grep com.mby     # confirm it is registered
+
+  To stop it:
+       launchctl unload ~/Library/LaunchAgents/com.mby.trading.desk.plist
+
+  WHY EVERY FIFTEEN MINUTES AND NOT THREE FIXED TIMES
+
+  launchd fires on LOCAL time and gives no way to say "09:45 New York".
+  Three fixed local times would be an hour wrong for several weeks a
+  year — the US and Europe change clocks on different dates, and much
+  of West Africa never changes at all — and being an hour wrong means
+  either trading into a closed market or missing the session entirely.
+
+  So this ticks every fifteen minutes and `orchestrator auto` reads the
+  Eastern clock itself, decides whether anything is due, checks whether
+  it already ran, and almost always exits immediately having done
+  nothing. Correct across every DST boundary with no maintenance, and a
+  tick missed because the machine was asleep is picked up by the next
+  one instead of losing the day.
+
+  RunAtLoad is true for the same reason: a laptop opened at 10:15 runs
+  the execution group it slept through, rather than waiting for the
+  next quarter hour.
+
+  THE ONE THING THIS CANNOT DO is run while the machine is asleep or
+  shut. A closed laptop is a desk that does not trade. If unattended
+  operation needs to survive that, the same wrapper belongs on an
+  always-on host — a small VPS or the Railway deployment the
+  orchestrator was originally written for — and the plist is then
+  replaced by that host's cron.
+  =====================================================================
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mby.trading.desk</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <!-- EDIT ME -->
+        <string>/Users/malickmbaye_1/Downloads/ai_trading_firm 6/scripts/run_desk.sh</string>
+        <string>auto</string>
+    </array>
+
+    <!-- EDIT ME -->
+    <key>WorkingDirectory</key>
+    <string>/Users/malickmbaye_1/Downloads/ai_trading_firm 6</string>
+
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Docker Desktop lives in /usr/local/bin or /opt/homebrew/bin
+      depending on the Mac. launchd's default PATH contains neither, and
+      the wrapper needs `docker` to bring the database up after a sleep.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!--
+      The wrapper writes its own dated log; these two catch anything
+      that fails before it gets that far — a bad path, a missing shell,
+      a permissions problem. That is exactly the class of failure that
+      otherwise leaves no trace at all.
+    -->
+    <key>StandardOutPath</key>
+    <string>/tmp/mby-desk.launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mby-desk.launchd.err</string>
+</dict>
+</plist>

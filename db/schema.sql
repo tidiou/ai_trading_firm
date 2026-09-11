@@ -228,7 +228,13 @@ CREATE TABLE IF NOT EXISTS orders (
     -- state on a refusal, the arithmetic on a rejected size, the sizing
     -- basis on an accepted order. A status is a verdict; this is the
     -- reason. Never parsed by code.
-    status_detail    TEXT
+    status_detail    TEXT,
+    -- When this row was written (migration 008). Otis's end-of-day
+    -- sweep reads it to tell an order that has had its session and did
+    -- not fill from one queued for a bell that has not rung yet —
+    -- without it the sweep cancelled orders minutes after they were
+    -- placed and recorded them as ordinary non-fills.
+    recorded_at      TIMESTAMPTZ DEFAULT now()
 );
 
 -- ============================================================
@@ -323,6 +329,23 @@ CREATE TABLE IF NOT EXISTS daily_pnl (
     -- portfolio's high-water mark.
     nav             NUMERIC(14,2)
 );
+
+-- The index the desk is measured against (migration 009). Its own
+-- table rather than columns on daily_pnl: the benchmark has sessions
+-- the desk does not, and unlike the desk's own history it can be
+-- backfilled from Alpaca years later.
+CREATE TABLE IF NOT EXISTS benchmark_history (
+    id               BIGSERIAL PRIMARY KEY,
+    bar_date         DATE NOT NULL,
+    ticker           TEXT NOT NULL,
+    close            NUMERIC(14,4) NOT NULL,
+    -- NULL on the first bar of a series: unknown, not zero.
+    daily_return_pct NUMERIC(10,6),
+    UNIQUE (bar_date, ticker)
+);
+
+CREATE INDEX IF NOT EXISTS idx_benchmark_history_ticker_date
+    ON benchmark_history (ticker, bar_date);
 
 CREATE TABLE IF NOT EXISTS discrepancies (
     id             BIGSERIAL PRIMARY KEY,

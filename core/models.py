@@ -244,6 +244,13 @@ class Order(Base):
     # verdict; a verdict with no evidence stops being explainable the
     # moment the condition that caused it is repaired.
     status_detail: Mapped[Optional[str]]
+    # When the row was written — see migration 008. Otis's sweep needs
+    # it to tell "this order has had its session and did not fill" from
+    # "this order is queued for a bell that has not rung yet". Set by
+    # the database so no return path in Ada can forget it. NULL on rows
+    # predating 008: unknown, not zero.
+    recorded_at: Mapped[Optional[datetime]] = mapped_column(
+        server_default=text("now()"))
 
 
 # ============================================================
@@ -311,6 +318,30 @@ class DailyPnl(Base):
     # breaker runs on. Deliberately NOT derived from total_pnl, which
     # is one day's figure rather than an equity curve.
     nav: Mapped[Optional[Decimal]]
+
+
+class BenchmarkHistory(Base):
+    """
+    The index the desk is measured against — see migration 009.
+
+    ITS OWN TABLE, NOT A COLUMN ON daily_pnl, for two reasons. The
+    benchmark exists on sessions the desk did not run, so bolting it
+    onto the desk's own series would make those days unrecordable. And
+    it is a market fact rather than a desk fact: different provenance,
+    different lifecycle, and fully backfillable from Alpaca long after
+    the fact, which is exactly what daily_pnl is not.
+    """
+    __tablename__ = "benchmark_history"
+    __table_args__ = (UniqueConstraint("bar_date", "ticker"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    bar_date: Mapped[date]
+    ticker: Mapped[str]
+    close: Mapped[Decimal]
+    # Session-over-session return, in percent. NULL on the first bar of
+    # a series — there is no prior close to compare against, and a zero
+    # there would read as "the market was flat that day".
+    daily_return_pct: Mapped[Optional[Decimal]]
 
 
 class Discrepancy(Base):

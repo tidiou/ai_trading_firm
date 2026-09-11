@@ -171,3 +171,52 @@ def get_run_status(run_date, agent_name: str) -> Optional[str]:
             .first()
         )
         return row.status if row else None
+
+
+def load_agent_output(run_date, agent_name: str,
+                      require_completed: bool = True) -> Optional[dict]:
+    """
+    What an agent returned, read back from the ledger.
+
+    THIS IS WHAT MAKES THE SPLIT CYCLE POSSIBLE (D10). When Phases 1-2
+    and Phases 3-4 run in the same process, Solomon's verdict is just a
+    local variable. Once they are separate scheduled runs — a morning
+    meeting before the open, execution after it — the later run has to
+    read the earlier one's conclusion from somewhere durable.
+
+    agent_runs.raw_output is already that somewhere: every agent's
+    return value has been written there since the run ledger was added.
+    This turns an existing debugging aid into the handoff, rather than
+    inventing a second place for the same fact to live and drift.
+
+    Returns None if the agent has no row for the day, or a row that did
+    not complete. A caller must treat that as "no verdict", never as
+    "no action needed" — those are different, and only one of them is
+    safe to act on.
+
+    `require_completed=False` is for the one caller that needs to read a
+    FAILED row: the orchestrator's retry counter, whose whole job is to
+    remember how many times a group has already failed today. Nothing
+    that makes a trading decision may use it.
+    """
+    with session_scope() as session:
+        row = (
+            session.query(AgentRun)
+            .filter(AgentRun.run_date == run_date, AgentRun.agent_name == agent_name)
+            .first()
+        )
+        if row is None:
+            return None
+        if require_completed and row.status != "completed":
+            return None
+        output = row.raw_output
+        if isinstance(output, dict) and output.get("truncated"):
+            # Serialisation truncates oversized payloads to a text
+            # preview. A preview is not a result, and parsing one back
+            # into a decision would be a guess dressed as a lookup.
+            logger.warning(
+                "agent_runs row for %s on %s is truncated — treating as no output.",
+                agent_name, run_date,
+            )
+            return None
+        return output if isinstance(output, dict) else None
