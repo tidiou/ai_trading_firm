@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS macro_briefs (
     regime_signal         TEXT NOT NULL,   -- risk-on|risk-off|neutral|transitioning
     change_from_yesterday TEXT NOT NULL,   -- none|minor|material
     confidence            TEXT NOT NULL,   -- low|medium|high
+    -- The probability actually being asserted (migration 010). Kept
+    -- BESIDE the prose rather than replacing it, because the prose is
+    -- what the model writes and what a human reads; the number is what
+    -- a Brier score needs. A proper scoring rule cannot be gamed by
+    -- hedging, which is the whole reason to want one.
+    confidence_pct        NUMERIC(5,2) CHECK (confidence_pct >= 0 AND confidence_pct <= 100),
     key_events            JSONB,
     notable_moves         JSONB,
     narrative             TEXT
@@ -94,7 +100,36 @@ CREATE TABLE IF NOT EXISTS theses (
     -- time, so the sector limit costs no extra API quota. NULL means
     -- genuinely unknown, and Nora treats an unknown-sector name as its
     -- own single-name bucket rather than pooling it with other unknowns.
-    sector              TEXT
+    sector              TEXT,
+    -- The falsifiable claim (migration 010). expected_move_pct is a
+    -- POSITIVE magnitude and expected_direction carries the sign, so a
+    -- down-thesis written with a positive number cannot be graded as
+    -- an up-thesis. horizon_days is fixed when the thesis is written
+    -- and never revised: picking a horizon after seeing the outcome is
+    -- the cheapest way to manufacture a good calibration score.
+    expected_direction  TEXT     CHECK (expected_direction IN ('up', 'down')),
+    expected_move_pct   NUMERIC(6,2) CHECK (expected_move_pct > 0),
+    horizon_days        SMALLINT CHECK (horizon_days > 0),
+    -- Why it ended. 'still_open' is deliberately not a value — that is
+    -- already closed_date IS NULL, and the same fact in two columns
+    -- eventually disagrees with itself.
+    close_reason        TEXT     CHECK (close_reason IN ('catalyst_resolved',
+                                                         'catalyst_invalidated',
+                                                         'risk_exit',
+                                                         'unrelated')),
+    -- All three prediction fields, or none. A half-written prediction
+    -- survives every "do we have a forecast?" filter and then fails
+    -- silently at scoring time — strictly worse than an empty one.
+    CONSTRAINT theses_prediction_complete CHECK (
+        (expected_direction IS NULL AND expected_move_pct IS NULL AND horizon_days IS NULL)
+        OR
+        (expected_direction IS NOT NULL AND expected_move_pct IS NOT NULL AND horizon_days IS NOT NULL)
+    ),
+    -- One-directional: a reason without a close is incoherent, a close
+    -- without a reason is every thesis closed before migration 010.
+    CONSTRAINT theses_close_reason_needs_close CHECK (
+        close_reason IS NULL OR closed_date IS NOT NULL
+    )
 );
 
 -- Daily monitoring tag for every currently held position.
@@ -121,6 +156,16 @@ CREATE TABLE IF NOT EXISTS new_candidates (
     key_risks          JSONB,
     valuation_snapshot JSONB,
     sector             TEXT,           -- from the FMP profile; see theses.sector
+    -- The falsifiable claim (migration 010); see theses for the sign
+    -- convention and why the horizon is never revised.
+    expected_direction TEXT     CHECK (expected_direction IN ('up', 'down')),
+    expected_move_pct  NUMERIC(6,2) CHECK (expected_move_pct > 0),
+    horizon_days       SMALLINT CHECK (horizon_days > 0),
+    CONSTRAINT new_candidates_prediction_complete CHECK (
+        (expected_direction IS NULL AND expected_move_pct IS NULL AND horizon_days IS NULL)
+        OR
+        (expected_direction IS NOT NULL AND expected_move_pct IS NOT NULL AND horizon_days IS NOT NULL)
+    ),
     UNIQUE (candidate_date, ticker)
 );
 
@@ -190,7 +235,18 @@ CREATE TABLE IF NOT EXISTS proposal_reviews (
     decision       TEXT NOT NULL,   -- approved|rejected
     max_size_pct   NUMERIC(5,2),
     rules_checked  JSONB,
-    reasoning      TEXT
+    reasoning      TEXT,
+    -- Which limit set the CEILING (migration 010) — not merely which
+    -- one refused. On an approval it names the tighter of the position
+    -- and sector headrooms, which is what constraint accounting needs
+    -- to price a trim as well as a rejection. Whether the trade was
+    -- refused is already in `decision`; different question, different
+    -- column. Nora computes this today and writes it into a
+    -- rules_checked sentence, where only a regex can reach it.
+    binding_rule   TEXT CHECK (binding_rule IN ('circuit_breaker',
+                                                'max_position_pct',
+                                                'max_sector_pct',
+                                                'reduction'))
 );
 
 -- ============================================================

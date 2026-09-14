@@ -73,6 +73,12 @@ class MacroBrief(Base):
     regime_signal: Mapped[str]
     change_from_yesterday: Mapped[str]
     confidence: Mapped[str]
+    # The probability actually being asserted — see migration 010. Kept
+    # beside the prose, not instead of it: the prose is what the model
+    # writes and what a human reads, the number is what a Brier score
+    # needs. Never derived from the prose — an invented probability
+    # produces a score that looks like evidence and is not.
+    confidence_pct: Mapped[Optional[Decimal]]
     key_events: Mapped[Optional[dict]] = mapped_column(JSONB)
     notable_moves: Mapped[Optional[dict]] = mapped_column(JSONB)
     narrative: Mapped[Optional[str]]
@@ -97,6 +103,19 @@ class Thesis(Base):
     # limit costs no extra quota. None = genuinely unknown; Nora treats
     # an unknown-sector name as its own bucket rather than pooling it.
     sector: Mapped[Optional[str]]
+    # The falsifiable claim — see migration 010. expected_move_pct is a
+    # POSITIVE magnitude; expected_direction carries the sign, so a
+    # down-thesis cannot be graded as an up-thesis. A database CHECK
+    # enforces all-three-or-none, because a half-written prediction
+    # passes every "do we have a forecast?" filter and then fails
+    # silently at scoring time.
+    expected_direction: Mapped[Optional[str]]   # 'up' | 'down'
+    expected_move_pct: Mapped[Optional[Decimal]]
+    horizon_days: Mapped[Optional[int]]
+    # Why the thesis ended. 'still_open' is deliberately not a value —
+    # that is closed_date is None. catalyst_resolved |
+    # catalyst_invalidated | risk_exit | unrelated.
+    close_reason: Mapped[Optional[str]]
 
 
 class PositionMonitoringLog(Base):
@@ -126,6 +145,10 @@ class NewCandidate(Base):
     key_risks: Mapped[Optional[dict]] = mapped_column(JSONB)
     valuation_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
     sector: Mapped[Optional[str]]  # from the FMP profile; see Thesis.sector
+    # See Thesis for the sign convention and the all-three-or-none rule.
+    expected_direction: Mapped[Optional[str]]   # 'up' | 'down'
+    expected_move_pct: Mapped[Optional[Decimal]]
+    horizon_days: Mapped[Optional[int]]
 
 
 # ============================================================
@@ -203,6 +226,13 @@ class ProposalReview(Base):
     max_size_pct: Mapped[Optional[Decimal]]
     rules_checked: Mapped[Optional[dict]] = mapped_column(JSONB)
     reasoning: Mapped[Optional[str]]
+    # Which limit set the CEILING — see migration 010. Not the same
+    # question as whether the trade was refused, which is `decision`.
+    # On an approval this names the tighter of the position and sector
+    # headrooms, which is what constraint accounting needs in order to
+    # price a trim rather than only a rejection.
+    # circuit_breaker | max_position_pct | max_sector_pct | reduction
+    binding_rule: Mapped[Optional[str]]
 
 
 # ============================================================

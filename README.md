@@ -85,3 +85,30 @@ exactly like a quiet day.
 
 A closed laptop is a desk that does not trade. For operation that
 survives that, run the same wrapper on an always-on host.
+
+## Abbreviations
+
+Only the ones that actually appear in this codebase, alphabetically.
+Where a term has a general meaning and a narrower one here, both are given.
+
+| | |
+|---|---|
+| **API** | Application Programming Interface — here, Alpaca (trading, market data) and FMP (fundamentals) |
+| **bps** | Basis points. 1 bp = 0.01%, so 100 bps = 1%. Used for execution slippage (`orders.slippage_bps`) because the numbers are too small to read in percent |
+| **CLI** | Command-Line Interface — the `python -m …` entry points. See `COMMANDS.md` |
+| **DAY** | An order's time-in-force: it expires at the close of the session it belongs to. Ada submits DAY limits, which is why the hour of submission matters |
+| **DST** | Daylight Saving Time. The US and EU change clocks on different dates, so for one week a year Berlin is ET + 5h instead of + 6h |
+| **ET** | Eastern Time (`America/New_York`), covering both EST in winter and EDT in summer. The desk's authoritative clock — every window is stated in ET |
+| **ETF** | Exchange-Traded Fund — a fund that trades like a single stock |
+| **FMP** | Financial Modeling Prep — the fundamentals data provider Vera uses for valuation and sector |
+| **IEX** | Investors Exchange — one exchange's own quotes. Alpaca's free data plan serves IEX only; `ALPACA_DATA_FEED=iex` |
+| **IR** | Information Ratio — active return divided by tracking error. The standard measure of skill against a benchmark, and the one that needs years of data to mean anything |
+| **JSONB** | Postgres' binary JSON column type. Used wherever an agent's output is structured but not worth its own table |
+| **LLM** | Large Language Model — Claude, in every agent that needs judgment rather than arithmetic |
+| **NAV** | Net Asset Value — cash plus the market value of all positions. Written each close to `daily_pnl.nav`; this is the equity curve the drawdown breaker runs on, deliberately not `total_pnl` |
+| **NYSE** | New York Stock Exchange. Its calendar decides what counts as a trading day |
+| **ORM** | Object-Relational Mapper — SQLAlchemy, mapping `core/models.py` classes onto tables |
+| **P&L** | Profit and Loss. *Realized* = crystallised by a sale; *unrealized* = today's mark-to-market change on what is still held |
+| **pp** | Percentage points — the gap between two percentages. A desk at +2% against an index at +3% is 1pp behind, not 1% behind. Kept distinct from `%` throughout |
+| **SIP** | Securities Information Processor — the consolidated tape across all US exchanges. A paid Alpaca tier; requesting it on the free plan returns HTTP 403 |
+| **SPY** | Ticker of the SPDR S&P 500 ETF Trust — the benchmark the desk is measured against. Fetched dividend-adjusted so it is a total-return series, matching how NAV already counts dividends received |

@@ -52,13 +52,13 @@
     <array>
         <string>/bin/bash</string>
         <!-- EDIT ME -->
-        <string>/Users/malickmbaye_1/Downloads/ai_trading_firm 6/scripts/run_desk.sh</string>
+        <string>/Users/malickmbaye_1/Projects/mby-trading/scripts/run_desk.sh</string>
         <string>auto</string>
     </array>
 
     <!-- EDIT ME -->
     <key>WorkingDirectory</key>
-    <string>/Users/malickmbaye_1/Downloads/ai_trading_firm 6</string>
+    <string>/Users/malickmbaye_1/Projects/mby-trading</string>
 
     <key>StartInterval</key>
     <integer>900</integer>
