@@ -51,6 +51,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from core.clients.claude_client import run_agent_loop, extract_json
 from core.benchmark import BENCHMARK_TICKER, performance_since_inception
 from core.db import session_scope
+from core.logging_utils import load_agent_output
 from core.models import (
     Order, Allocation, ProposalReview, Proposal, StrategyDecision,
     Position, PositionMonitoringLog, DailyPnl, Attribution, ProcessCheck,
@@ -247,6 +248,50 @@ def run(today: date) -> dict:
     }
 
 
+def _vera_section(today: date, candidates: list) -> str:
+    """Vera's line in the daily report.
+
+    "No new candidates today." was true and useless: it is the same
+    sentence whether nothing came close, one name missed the bar by a
+    point, or the screening pass failed and the failure was swallowed.
+    Vera now records a computed statement about the pass, so prefer it.
+
+    READ FROM THE RUN LEDGER, NOT RECOMPUTED. The statement is a fact
+    about what happened in that run, and re-deriving it here from
+    today's tables would silently change it if a later rerun screened a
+    different universe. Falls back to the candidate count when the
+    statement is absent — a run predating this change, or a day Vera
+    did not run at all, and those must not look identical either.
+    """
+    vera_output = load_agent_output(today, "vera")
+    if vera_output is None:
+        return "Did not run today."
+
+    screening = vera_output.get("screening") or {}
+    statement = screening.get("statement")
+    if not statement:
+        # Pre-change run: say only what such a row can support.
+        return (
+            f"{len(candidates)} new candidate(s): "
+            + ", ".join(c.ticker for c in candidates)
+            if candidates else
+            "No new candidates today (run predates screening summaries, "
+            "so how close anything came is not on record)."
+        )
+
+    held_back = vera_output.get("held_back") or []
+    if held_back and not screening.get("surfaced_count"):
+        # The near-misses are the interesting half on a quiet day, and
+        # they are the whole reason this section changed.
+        scores = ", ".join(
+            f"{h['ticker']} {h['conviction_score']}"
+            for h in sorted(held_back,
+                            key=lambda h: -h.get("conviction_score", 0))
+        )
+        return f"{statement}\n\nScored: {scores}."
+    return statement
+
+
 def compile_daily_report(today: date) -> dict:
     """
     The Daily Closing Report — Clara's expanded responsibility
@@ -263,10 +308,7 @@ def compile_daily_report(today: date) -> dict:
 
         sections = {
             "ATLAS (Macro)": atlas_row.narrative if atlas_row else "Did not run today.",
-            "VERA (Research)": (
-                f"{len(candidates)} new candidate(s): " + ", ".join(c.ticker for c in candidates)
-                if candidates else "No new candidates today."
-            ),
+            "VERA (Research)": _vera_section(today, candidates),
             "SOLOMON (Strategy)": decision.narrative if decision else "Did not run today.",
             "NORA (Risk)": f"Portfolio status: {risk.portfolio_status}" if risk else "Did not run today.",
             "ADA (Execution)": (

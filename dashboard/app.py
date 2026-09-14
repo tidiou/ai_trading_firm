@@ -996,6 +996,15 @@ class Desk:
                          "ORDER BY brief_date DESC LIMIT 1")
         self.cands_today = one("SELECT count(*) AS n FROM new_candidates "
                                "WHERE candidate_date = %s", (et_today,))
+        # Vera's screening summary, from the run ledger rather than a
+        # table of its own. It is the only record of the names that did
+        # NOT clear the surfacing bar — new_candidates holds what was
+        # put forward, and on a quiet day the near-misses are the
+        # informative half.
+        self.screening = one(
+            "SELECT raw_output -> 'screening' AS s FROM agent_runs "
+            "WHERE run_date = %s AND agent_name = 'vera' "
+            "AND status = 'completed'", (et_today,))
         self.strat = one("SELECT decision_date, action_needed, narrative "
                          "FROM strategy_decisions ORDER BY decision_date DESC LIMIT 1")
         self.escal = one("SELECT count(*) FILTER (WHERE action_needed) AS acted, "
@@ -1160,10 +1169,23 @@ class Desk:
 
         if name == "Vera":
             n = int(self.cands_today["n"]) if self.cands_today is not None else 0
+            # Best conviction reached, surfaced or not. On a desk that
+            # surfaces almost nothing, "0 candidates" every day says
+            # nothing about whether anything came close — this does.
+            # .get(), not ["s"]: a row that came back without the
+            # column must render as "not measured", never raise here.
+            s = self.screening.get("s") if self.screening is not None else None
+            if s and s.get("best_conviction") is not None:
+                score = int(s["best_conviction"])
+                tone = C["green"] if score >= int(s.get("threshold", 4)) else C["muted"]
+                best = col(f'{score} ({esc(str(s.get("best_conviction_ticker")))})', tone)
+            elif s:
+                best = missing("Vera screened today but returned no read on any "
+                               "name — a failed pass, not a quiet one.")
+            else:
+                best = missing("Vera has not completed a screening pass today.")
             return [("Candidates surfaced today", str(n)),
-                    ("Conviction-5 hit rate",
-                     missing("Needs weekly_reports.vera_calibration, which Clara does "
-                             "not populate yet — the column exists and is empty."))]
+                    ("Best conviction today", best)]
 
         if name == "Solomon":
             if self.strat is not None and self.strat["decision_date"] == et_today:
@@ -1501,6 +1523,47 @@ def _d_atlas(desk: Desk) -> None:
 
 
 def _d_vera(desk: Desk) -> None:
+    st.subheader("Screening pass")
+    st.caption("What the screening pass did — including on the days it surfaced "
+               "nothing. A name scoring below the bar leaves no row in "
+               "new_candidates, so without this panel 'nothing came close' and "
+               "'one name missed by a point' look identical.")
+    s = desk.screening.get("s") if desk.screening is not None else None
+    if not s:
+        st.info("No completed screening pass today.")
+    else:
+        st.markdown(f"**{esc(str(s.get('statement', '')))}**")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Screened",
+                  f"{s.get('screened_count', 0)} of {s.get('universe_size', 0)}")
+        c2.metric("Surfaced", s.get("surfaced_count", 0))
+        best = s.get("best_conviction")
+        c3.metric("Best conviction",
+                  "—" if best is None else f"{best} / {s.get('threshold', 4)}")
+
+        dist = s.get("conviction_distribution") or {}
+        if dist:
+            st.caption("Conviction across the names screened. The shape of this "
+                       "over weeks says whether the bar is a notch too high or "
+                       "the universe is too narrow — clustering at 3-4 is a "
+                       "calibration question, clustering at 1-2 means no "
+                       "threshold change will help.")
+            table(pd.DataFrame(
+                [{"conviction": k, "names": v} for k, v in sorted(dist.items())]))
+
+        if s.get("not_returned"):
+            st.warning(
+                "No read returned on: " + ", ".join(s["not_returned"])
+                + ". Best conviction above is therefore a floor, not the true "
+                  "maximum — some names went unscored.")
+        if s.get("excluded_as_held"):
+            st.caption("Excluded as already held: " + ", ".join(s["excluded_as_held"]))
+
+    st.caption("Conviction-5 hit rate is still unmeasured — it needs "
+               "weekly_reports.vera_calibration, which Clara does not populate "
+               "yet. The column exists and is empty.")
+
+    st.divider()
     st.subheader("Open theses")
     st.caption("A thesis she opened is one she has to keep defending or close.")
     df = load("SELECT ticker, opened_date, original_conviction, sector, thesis_text "

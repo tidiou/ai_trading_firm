@@ -35,7 +35,7 @@ belt-and-suspenders layer on top of that hard capability limit.
 from datetime import date, timedelta
 from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -130,6 +130,23 @@ def execute_tool(tool_name: str, tool_input: dict):
 # infrequent "real" run rather than routine testing.
 FIXED_UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "JPM"]
 
+# The conviction at or above which a screened name is SURFACED as a
+# new_candidates row. Below it the name is counted in the screening
+# summary and discarded.
+#
+# SET TO MATCH SOLOMON'S new_position BAR DELIBERATELY. He requires
+# conviction >= 4 with a named catalyst, so surfacing a 3 would write a
+# row that can only ever be rejected downstream — noise in the table
+# and in the dashboard, with no decision riding on it.
+#
+# THE POINT OF THE CONSTANT is that the decision now lives in CODE
+# rather than inside the model's response. Vera reports her read on
+# every name she screened; this line decides what becomes a row. Before
+# this, a name scoring 3 was discarded inside the model's answer and
+# left no trace anywhere, so "nothing was close" and "one name nearly
+# cleared the bar" were the same observation: an empty table.
+SURFACING_THRESHOLD = 4
+
 
 # =================================================================
 # [5] OUTPUT CONTRACTS — one per job, mirroring the Operating
@@ -144,12 +161,26 @@ class PositionMonitoring(BaseModel):
 
 
 class NewCandidateOutput(BaseModel):
+    """One screened name — NOT necessarily one that gets surfaced.
+
+    Vera now returns an entry for every ticker she screened, and
+    `SURFACING_THRESHOLD` decides which become new_candidates rows. So
+    the supporting fields carry defaults: a name she scores 2 needs a
+    ticker, a score and a line of reasoning, not a full valuation
+    workup she then throws away. A name at or above the bar is required
+    to have the full set, and that requirement is enforced in
+    `partition_screened()` rather than here — Pydantic cannot express
+    "required only when another field is high", and hiding the rule in
+    a validator would put a surfacing decision back inside the
+    contract, which is exactly what this change moves out of it.
+    """
+
     ticker: str
     thesis: str
-    catalyst: str
     conviction_score: int  # 1-5
-    key_risks: list[str]
-    valuation_snapshot: dict
+    catalyst: str = ""
+    key_risks: list[str] = Field(default_factory=list)
+    valuation_snapshot: dict = Field(default_factory=dict)
 
 
 # =================================================================
@@ -237,12 +268,13 @@ weeks-to-months holding horizon.
 Rules:
 - Only investigate tickers from the list you're given — this is a
   pre-filtered universe, not an invitation to consider anything else.
-- Zero good candidates is a completely valid, expected outcome on
-  most days — do not force a mediocre idea into existence just to
-  have something to report.
-- Every candidate needs a genuine, named catalyst — not just "looks
-  cheap" or "good company." If you can't articulate why NOW, it's
-  not ready to surface.
+- REPORT ON EVERY TICKER IN THE LIST, including the ones you think are
+  nowhere near worth acting on. You are not deciding what gets acted
+  on — you are recording your read. A name you score 2 is a finding,
+  not a non-answer, and the firm needs it on record.
+- Zero names worth acting on is a completely valid, expected outcome
+  on most days — do not inflate a score to have something to report.
+  Reporting six 2s is a complete, useful day's work.
 - Never use the words "buy" or "sell" — you produce theses and
   conviction scores, not trade instructions. Sizing and execution
   are other agents' jobs entirely.
@@ -250,26 +282,155 @@ Rules:
   drive a stock-specific call — a bullish idea needs its own
   company-specific catalyst even in a risk-on backdrop.
 - Score conviction 1-5 honestly: 5 should be rare. Most genuinely
-  good ideas are a 3 or 4.
+  good ideas are a 3 or 4, and on a quiet day most names are 1-2.
+- A score of 4 or 5 means you are asserting this is actionable NOW,
+  so those entries MUST carry a genuine, named catalyst — not "looks
+  cheap" or "good company". If you cannot articulate why NOW, the
+  honest score is 3, not a 4 with a vague catalyst.
+- For a name you score 1-3, `thesis` can be a single sentence and
+  `catalyst`, `key_risks` and `valuation_snapshot` may be omitted.
+  Don't spend a full workup on a name you are not putting forward.
 
 Respond with ONLY a JSON array — your response must start with "["
 as its very first character and contain nothing else: no headers, no
 "screening notes" sections, no explanation of your reasoning process,
 no text before or after the array. Do your reasoning silently and
-output only the final result. Most days this array should be short
-or empty:
+output only the final result. The array should have ONE ENTRY PER
+TICKER you were given:
 
 [
   {
     "ticker": "...",
-    "thesis": "2-3 sentences on why this company, why now",
-    "catalyst": "the specific, named reason this matters now",
+    "thesis": "2-3 sentences if you score this 4-5; one line if 1-3",
     "conviction_score": 1-5,
+    "catalyst": "the specific, named reason this matters now — REQUIRED at 4-5, omit at 1-3",
     "key_risks": ["...", "..."],
     "valuation_snapshot": {"note": "key numbers that informed this view"}
   }
 ]
 """
+
+
+# =================================================================
+# SCREENING SUMMARY — what the pass did, including when it did
+# nothing
+#
+# WHY THIS EXISTS. The monitoring pass writes a row per held name
+# every day, so it always speaks. The screening pass did not: when it
+# found nothing it wrote zero new_candidates rows and nothing else, so
+# three different situations were one observation —
+#
+#     screened everything, nothing came close
+#     screened everything, one name nearly cleared the bar
+#     screening errored and the failure was swallowed upstream
+#
+# — all of which are an empty table. That is the same
+# absence-versus-expectation problem that `orchestrator.cycle_status`
+# exists for, and the same principle as the dashboard's rule that a
+# metric with no table behind it shows its reason rather than nothing.
+#
+# WHY IT IS COMPUTED, NOT NARRATED. The temptation is to ask the model
+# to explain why it surfaced nothing. Two problems: it will produce a
+# fluent explanation whether or not that was the reason, and asking an
+# agent to justify an empty result puts pressure on it to find
+# something to say — one short step from finding something to surface,
+# which is the exact pressure the restraint principle exists to
+# resist. So every field below is derived in code from the scores she
+# returned. There is no narrative field, and that is deliberate.
+# =================================================================
+def partition_screened(
+    screened: list[NewCandidateOutput],
+    threshold: int = SURFACING_THRESHOLD,
+) -> tuple[list[NewCandidateOutput], list[NewCandidateOutput]]:
+    """Split screened names into (surfaced, held_back).
+
+    Surfacing requires BOTH a score at or above the threshold AND a
+    non-empty catalyst. The second half is not redundant: the prompt
+    says a 4 must name its catalyst, and a 4 that doesn't has failed
+    its own stated standard. Writing it as a candidate row anyway
+    would hand Solomon a proposal whose `linked_trigger` cannot name
+    anything — so it is held back, and counted, rather than surfaced.
+    """
+    surfaced, held_back = [], []
+    for item in screened:
+        if item.conviction_score >= threshold and item.catalyst.strip():
+            surfaced.append(item)
+        else:
+            held_back.append(item)
+    return surfaced, held_back
+
+
+def screening_summary(
+    universe: list[str],
+    screened: list[NewCandidateOutput],
+    surfaced: list[NewCandidateOutput],
+    held_tickers: list[str],
+    threshold: int = SURFACING_THRESHOLD,
+) -> dict:
+    """A statement about the screening pass, whether or not it surfaced
+    anything. Every number here is computed, or None with the reason
+    implied by the shape — never a placeholder.
+
+    `best_conviction` is the field this was built for. Over weeks it
+    separates two hypotheses that look identical from outside:
+
+        consistently 3-4  the bar is roughly right and the universe is
+                          producing near-misses — a calibration question
+        consistently 1-2  the universe has nothing to offer, and no
+                          threshold change will help
+    """
+    returned = [s.ticker for s in screened]
+    best = max(screened, key=lambda s: s.conviction_score, default=None)
+
+    # A shortfall between what was asked for and what came back makes
+    # best_conviction unreliable, so it is reported rather than
+    # smoothed over. Names are listed, not just counted: which ticker
+    # went missing is the actionable half.
+    not_returned = [t for t in universe if t not in returned]
+
+    return {
+        "universe_size": len(universe),
+        "screened_count": len(screened),
+        "not_returned": not_returned,
+        "excluded_as_held": sorted(held_tickers),
+        "threshold": threshold,
+        "surfaced_count": len(surfaced),
+        "surfaced_tickers": [s.ticker for s in surfaced],
+        "best_conviction": best.conviction_score if best else None,
+        "best_conviction_ticker": best.ticker if best else None,
+        "conviction_distribution": {
+            str(score): sum(1 for s in screened if s.conviction_score == score)
+            for score in range(1, 6)
+            if any(s.conviction_score == score for s in screened)
+        },
+        "held_back_count": len(screened) - len(surfaced),
+    }
+
+
+def describe_screening(summary: dict) -> str:
+    """One line for the daily report and the dashboard. Reads the
+    computed summary only — it never reaches for the model."""
+    if summary["screened_count"] == 0:
+        return ("Screening returned nothing at all — not "
+                "'no ideas', but no read on any name. Treat as a failed pass.")
+
+    parts = [f"{summary['screened_count']} of {summary['universe_size']} screened"]
+    if summary["excluded_as_held"]:
+        parts.append(f"{', '.join(summary['excluded_as_held'])} held")
+    if summary["not_returned"]:
+        parts.append(f"no read on {', '.join(summary['not_returned'])}")
+
+    head = " · ".join(parts) + "."
+
+    if summary["surfaced_count"]:
+        tail = (f" Surfaced {summary['surfaced_count']}: "
+                f"{', '.join(summary['surfaced_tickers'])}.")
+    else:
+        tail = (f" Nothing surfaced. Best conviction "
+                f"{summary['best_conviction']} "
+                f"({summary['best_conviction_ticker']}) against a bar of "
+                f"{summary['threshold']}.")
+    return head + tail
 
 
 # =================================================================
@@ -510,10 +671,35 @@ def run(today: date, atlas_output: dict) -> dict:
         tool_executor=execute_tool,
         max_tokens=4000,  # up to 16 tickers screened, each candidate needs a full thesis/risks/valuation
     )
-    candidate_results = [
+    screened_results = [
         NewCandidateOutput.model_validate(item)
         for item in extract_json(screening_raw)
     ]
+
+    # The surfacing decision, in code. `candidate_results` keeps its
+    # old meaning — the names that become new_candidates rows and that
+    # Solomon may act on — so nothing downstream changes. What is new
+    # is that the names which did NOT clear the bar still exist here
+    # long enough to be counted.
+    candidate_results, held_back = partition_screened(screened_results)
+    screening = screening_summary(
+        universe=screening_universe,
+        screened=screened_results,
+        surfaced=candidate_results,
+        held_tickers=held_tickers,
+    )
+    # The rendered sentence is stored ALONGSIDE the numbers it comes
+    # from, deliberately. It costs a little denormalisation and buys
+    # two things: no consumer needs to import a formatter from an agent
+    # module just to display a line, and the ledger keeps what was
+    # actually said on the day even if the wording is changed later.
+    screening["statement"] = describe_screening(screening)
+    logger.info("Vera screening — %s", screening["statement"])
+    if held_back:
+        logger.info(
+            "Held back below the bar: %s",
+            ", ".join(f"{h.ticker} ({h.conviction_score})" for h in held_back),
+        )
 
     # -------------------------------------------------------------
     # [7] PERSISTENCE — both jobs' results, as upserts. Same
@@ -610,6 +796,21 @@ def run(today: date, atlas_output: dict) -> dict:
         "candidates": [c.model_dump() for c in candidate_results],
         "orphan_reviews": orphan_reviews,
         "data_coverage": data_coverage,
+        # What the screening pass did, including on the days it did
+        # nothing. Rides in the return dict rather than a new table:
+        # the orchestrator already persists this to
+        # agent_runs.raw_output, which is JSONB and therefore
+        # queryable later for the best_conviction trend. No migration.
+        "screening": screening,
+        # Her read on the names that did not clear the bar. Kept in the
+        # run ledger only, never written to new_candidates — a row
+        # there is a name the firm is putting forward, and these are
+        # not. Scores are trimmed of the full workup they never had.
+        "held_back": [
+            {"ticker": h.ticker, "conviction_score": h.conviction_score,
+             "thesis": h.thesis}
+            for h in held_back
+        ],
     }
 
 

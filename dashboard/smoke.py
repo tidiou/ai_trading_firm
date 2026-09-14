@@ -333,6 +333,21 @@ def fake_read_sql(query, con, params=None):
         return pd.DataFrame([{"open_n": 1, "total": 1}])
     if "FILTER (WHERE action_needed)" in q:
         return pd.DataFrame([{"acted": 1, "total": 14}])
+    # Vera's screening summary lives in agent_runs.raw_output, so it
+    # cannot come from the agent_runs fixture rows — those describe the
+    # RUN, this describes what the run found. A quiet day with one
+    # near-miss, which is the case the panel exists to make legible.
+    if "raw_output -> 'screening'" in q:
+        return pd.DataFrame([{"s": {
+            "universe_size": 5, "screened_count": 5, "not_returned": [],
+            "excluded_as_held": ["AAPL"], "threshold": 4,
+            "surfaced_count": 0, "surfaced_tickers": [],
+            "best_conviction": 3, "best_conviction_ticker": "NVDA",
+            "conviction_distribution": {"1": 1, "2": 3, "3": 1},
+            "held_back_count": 5,
+            "statement": ("5 of 5 screened · AAPL held. Nothing surfaced. "
+                          "Best conviction 3 (NVDA) against a bar of 4."),
+        }}])
     if "count(*) AS n FROM new_candidates" in q:
         return pd.DataFrame([{"n": 3}])
     if "risk_breaches" in q and "count(*)" in q:
