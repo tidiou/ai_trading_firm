@@ -8,7 +8,7 @@ codebase will have. Find each one by its numbered marker below.
   [1] ROLE / MANDATE   -> ATLAS_SYSTEM_PROMPT           (his "job description")
   [2] SKILLS / TOOLS    -> ATLAS_TOOLS                   (what he's allowed to do)
   [3] TOOL DISPATCH     -> execute_tool()                 (tool name -> real code)
-  [4] THE AGENTIC LOOP  -> run_agent_loop() call in run()  (Claude drives it, not us)
+  [4] THE AGENTIC LOOP  -> run_validated_agent_loop() in run() (Claude drives it, not us)
   [5] OUTPUT CONTRACT   -> AtlasOutput                     (hard schema = guardrail)
   [6] MEMORY            -> get_yesterdays_signal()          (exactly 1 prior fact)
   [7] PERSISTENCE       -> the second `with session_scope()` block in run()
@@ -72,7 +72,7 @@ from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.clients import fmp_client
-from core.clients.claude_client import run_agent_loop, extract_json
+from core.clients.claude_client import run_validated_agent_loop
 from core.db import session_scope
 from core.models import MacroBrief
 from core.theme import (
@@ -405,19 +405,30 @@ def run(today: date) -> dict:
     # ourselves. Every tool call Claude makes gets routed through
     # [3] execute_tool() before coming back to him.
     # =============================================================
-    raw_response = run_agent_loop(
+    # [5] OUTPUT CONTRACT enforced inside this call: a malformed or
+    # off-contract response never reaches the database. The contract
+    # is not softened by the retry — one corrective round is offered,
+    # the model is told exactly which rule it broke, and a second
+    # failure raises with both errors. See the note in claude_client.
+    #
+    # The retry matters more here than it looks. This agent's rules
+    # about where a ticker may appear are new, and the likeliest
+    # failure is a near-miss — a ticker written into the narrative out
+    # of the habit the OLD prompt trained. Without a repair round that
+    # single slip killed the whole premarket group.
+    output = run_validated_agent_loop(
         system_prompt=build_system_prompt(),
         user_prompt=user_prompt,
         tools=ATLAS_TOOLS,
         tool_executor=execute_tool,
+        validate=AtlasOutput.model_validate,
+        # Raised from 2000. That budget predates `read_across`, and a
+        # truncated structured array does not look like truncation —
+        # it arrives as malformed JSON and sends you to the prompt
+        # instead of to this number.
+        max_tokens=3000,
+        agent_name="Atlas",
     )
-
-    # [5] OUTPUT CONTRACT enforced here: a malformed or off-contract
-    # response raises BEFORE anything touches the database — never
-    # silently store something that doesn't match what the rest of
-    # the system expects to read back later.
-    parsed = extract_json(raw_response)
-    output = AtlasOutput.model_validate(parsed)
 
     # =============================================================
     # [7] PERSISTENCE — the one durable trace of this entire run.

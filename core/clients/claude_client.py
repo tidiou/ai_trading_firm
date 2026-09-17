@@ -21,12 +21,16 @@ particular job.
 """
 
 import json
+import logging
 import os
+from typing import Optional
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # The Anthropic SDK has NO default timeout unless one is set here —
 # without this, a stalled/hung request (bad network, an unusual API
@@ -76,6 +80,21 @@ def run_agent_loop(
             messages=messages,
         )
 
+        if response.stop_reason == "max_tokens":
+            # TRUNCATION DOES NOT LOOK LIKE TRUNCATION. A response cut
+            # off mid-JSON reaches extract_json as malformed text, and
+            # the error that surfaces is "No JSON array or object
+            # found" — which reads like a model that ignored its
+            # instructions rather than a budget that was too small.
+            # Naming it here saves the wrong investigation, and this
+            # got more likely the moment agents started returning
+            # structured arrays rather than a few short strings.
+            raise RuntimeError(
+                f"Claude's response hit the {max_tokens}-token limit and was cut "
+                f"off before it finished. This is a max_tokens problem, NOT a "
+                f"formatting one — raise max_tokens for this agent rather than "
+                f"rewording its prompt.")
+
         if response.stop_reason != "tool_use":
             # Claude decided it has enough — this is the final answer.
             text_blocks = [b.text for b in response.content if b.type == "text"]
@@ -102,6 +121,138 @@ def run_agent_loop(
     raise RuntimeError(
         f"Agent loop exceeded {MAX_TOOL_ITERATIONS} tool-use iterations without a final answer."
     )
+
+
+# =================================================================
+# VALIDATION REPAIR
+#
+# WHY THIS EXISTS. Every agent's output contract is a hard Pydantic
+# schema, deliberately: bad data must never reach the database. But
+# `run_agent_loop` returns text and the caller validates it, so a
+# validation failure was a SINGLE-SHOT KILL — one off-contract
+# response and the whole cycle group died with a ValidationError.
+#
+# That was tolerable while the contracts were four enum fields and a
+# paragraph. It stopped being tolerable as the contracts grew: Atlas
+# now has four structural rules about where a ticker may appear and
+# what may be said about it, and Vera's assumption output has more.
+# The likeliest failure is not a wild one — it is a near-miss, like a
+# ticker written into the narrative out of habit, which a model can
+# fix immediately if it is simply told.
+#
+# So: one repair round. The contract does not get softer; the model
+# gets told precisely what it broke and asked again.
+#
+# THE REPAIR TURN DELIBERATELY CARRIES NO TOOLS. The model already
+# gathered its data in the first pass and its own answer is in
+# context, so it needs no new information to correct a format or a
+# rule violation. Passing tools would let the loop re-run and spend
+# the FMP daily quota a second time for nothing — and on a 250/day
+# free tier, a repair that silently doubles the bill is its own
+# outage.
+#
+# ONE ROUND, NOT A LOOP. A contract a model cannot satisfy in two
+# tries is a prompt bug, and retrying it four times converts a loud
+# bug into a slow, expensive, quiet one.
+# =================================================================
+MAX_REPAIR_ROUNDS = 1
+
+_REPAIR_INSTRUCTION = """Your previous response did not satisfy the output contract and was REJECTED. It was not stored.
+
+The validation error was:
+
+{error}
+
+Correct it and return ONLY the corrected JSON object — no markdown fences, no explanation, no apology. Keep every factual value from your previous answer that the error did not complain about; change only what the error names. Do not call any tools.
+"""
+
+
+def run_validated_agent_loop(
+    system_prompt: str,
+    user_prompt: str,
+    tools: list[dict],
+    tool_executor,
+    validate,
+    model: str = DEFAULT_MODEL,
+    max_tokens: int = 2000,
+    agent_name: str = "agent",
+):
+    """Run the agent loop, then validate — with one repair round.
+
+    `validate` is any callable that takes the parsed dict and either
+    returns the validated object or raises. In practice this is a
+    Pydantic model's `.model_validate`, so the exception text already
+    names the offending field and value; the agents' validators are
+    written with that in mind, listing what IS permitted rather than
+    only what was wrong.
+
+    Returns whatever `validate` returns. Raises the SECOND failure,
+    with the first attached, when the repair also fails — both are
+    needed to tell "the model misunderstood once" from "the contract
+    is unsatisfiable".
+    """
+    raw = run_agent_loop(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        tools=tools,
+        tool_executor=tool_executor,
+        model=model,
+        max_tokens=max_tokens,
+    )
+
+    first_error: Optional[Exception] = None
+    for attempt in range(MAX_REPAIR_ROUNDS + 1):
+        try:
+            validated = validate(extract_json(raw))
+            if attempt:
+                # Loud on purpose. A repair that happens every single
+                # morning is a prompt that needs fixing, and a quiet
+                # retry would hide exactly that.
+                logger.warning(
+                    "%s failed its output contract and was repaired on retry. "
+                    "The run succeeded, but a repair is a defect, not a "
+                    "feature — if this recurs daily the prompt is wrong, not "
+                    "the model. Original error: %s", agent_name, first_error)
+            return validated
+        except Exception as exc:            # ValidationError or a JSON failure
+            if attempt >= MAX_REPAIR_ROUNDS:
+                if first_error is not None:
+                    raise RuntimeError(
+                        f"{agent_name} failed its output contract twice.\n\n"
+                        f"FIRST attempt: {first_error}\n\n"
+                        f"AFTER being told the error: {exc}\n\n"
+                        f"Two failures in a row usually means the contract "
+                        f"cannot be satisfied as written — check the prompt "
+                        f"and the validator agree before blaming the model."
+                    ) from exc
+                raise
+            first_error = exc
+            logger.warning("%s output rejected; requesting one correction. %s",
+                           agent_name, exc)
+            raw = _repair_round(system_prompt, user_prompt, raw, exc,
+                                model=model, max_tokens=max_tokens)
+
+    raise AssertionError("unreachable")     # pragma: no cover
+
+
+def _repair_round(system_prompt: str, user_prompt: str, bad_answer: str,
+                  error: Exception, *, model: str, max_tokens: int) -> str:
+    """One corrective turn. No tools — see the note above."""
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=[
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": bad_answer},
+            {"role": "user", "content": _REPAIR_INSTRUCTION.format(error=error)},
+        ],
+    )
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError(
+            f"The correction attempt hit the {max_tokens}-token limit and was "
+            f"cut off. Raise max_tokens — the contract may be fine.")
+    return "".join(b.text for b in response.content if b.type == "text")
 
 
 def _find_json_span(text: str) -> str:
