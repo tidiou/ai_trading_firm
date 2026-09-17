@@ -256,9 +256,15 @@ def _fake_track(_d, name, _p, called=None):
 
 def _stub_orchestrator(monkeypatch, orchestrator, called=None):
     """Everything the runner touches outside the agents themselves:
-    the calendar, the kill switch, the run ledger, and the two DB reads
-    the split introduced."""
+    the calendar, the kill switch, the run ledger, the two DB reads
+    the split introduced, and the schema gate."""
     monkeypatch.setattr(orchestrator, "is_trading_day", lambda d: True)
+    # The schema gate opens run_group with a real information_schema
+    # query. Stubbed to a no-op here rather than made tolerant of a
+    # failed connection: a gate that passed quietly when the database
+    # was unreachable would only work when it was not needed. Its own
+    # behaviour is covered in test_schema_check.py.
+    monkeypatch.setattr(orchestrator, "require_schema", lambda *a, **k: None)
     monkeypatch.setattr(orchestrator, "get_trading_control_state",
                         lambda: type("S", (), {"trading_enabled": True,
                                                "describe": lambda self: "ENABLED"})())

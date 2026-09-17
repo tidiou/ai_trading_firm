@@ -109,6 +109,7 @@ from core.cycle_schedule import (
 )
 from core.logging_utils import load_agent_output, log_agent_run, track_agent_run
 from core.market_calendar import is_trading_day
+from core.schema_check import SchemaOutOfDate, require_schema
 from core.trading_control import get_state as get_trading_control_state
 from agents import atlas, vera, solomon, nora, marcus, ada, otis, clara
 
@@ -363,6 +364,34 @@ def run_group(group: str, today: Optional[date] = None) -> dict:
     if group not in GROUP_RUNNERS:
         raise ValueError(f"unknown phase group {group!r} — "
                          f"expected one of {', '.join(GROUP_ORDER)}")
+
+    # =============================================================
+    # THE SCHEMA GATE — and its POSITION is the design.
+    #
+    # It sits above `_attempts_so_far` and above the "running" cycle
+    # row on purpose, so a database that is behind the code costs NO
+    # ATTEMPT. That matters more than it looks: on 17 Sept a missing
+    # column burned all three attempts in half an hour, and the retry
+    # cap then refused the group for the rest of the day — so even
+    # after the migration was applied, `auto` would not pick the
+    # window back up. Gating here means applying the migration
+    # mid-window is enough: the very next tick runs normally.
+    #
+    # It also sits above `_announce_control_state()`, which reads the
+    # database itself, and above every model and data-provider call.
+    # A schema gap should cost the tick and nothing else — no tokens,
+    # no FMP quota.
+    #
+    # Refusing rather than raising keeps `auto`'s log readable: this
+    # is a known, named, actionable condition, not a crash.
+    # =============================================================
+    try:
+        require_schema()
+    except SchemaOutOfDate as exc:
+        return {"action": "refused", "reason": "schema out of date",
+                "group": group, "date": today,
+                "gaps": [g.label() for g in exc.gaps],
+                "errors": [str(exc)]}
 
     spec = PHASE_GROUPS[group]
     trading_enabled = _announce_control_state()
