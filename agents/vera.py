@@ -44,7 +44,9 @@ import logging
 from core.clients import fmp_client
 from core.clients.claude_client import run_agent_loop, extract_json
 from core.db import session_scope
-from core.models import Thesis, PositionMonitoringLog, NewCandidate, Position, RiskPolicyVersion, PositionPnlHistory
+from core.models import (Thesis, PositionMonitoringLog, NewCandidate, Position,
+                         RiskPolicyVersion, PositionPnlHistory, ThesisAssumption)
+from core.thesis import AssumptionCheck, compute_verdict
 
 logger = logging.getLogger(__name__)
 
@@ -152,12 +154,50 @@ SURFACING_THRESHOLD = 4
 # [5] OUTPUT CONTRACTS — one per job, mirroring the Operating
 # Manual's two output shapes exactly.
 # =================================================================
+class AssumptionOut(BaseModel):
+    """One claim a thesis rests on, as Vera authors it.
+
+    `falsify_threshold` is prose rather than a number because the
+    claims that matter are not all numeric — "management keeps
+    repurchasing below intrinsic value" has no numeric threshold, and
+    demanding one would either exclude the claim or invite a
+    fabricated figure. The requirement is specificity a later reader
+    can judge, which the prompt asks for and review enforces.
+    """
+
+    claim: str
+    metric: Optional[str] = None
+    direction: Optional[Literal["up", "down", "stable"]] = None
+    falsify_threshold: Optional[str] = None
+    is_load_bearing: bool = True
+
+
+class AssumptionCheckOut(BaseModel):
+    """What one claim did since it was last looked at.
+
+    NOTE THE ABSENCE OF A VERDICT FIELD. Vera reports per-claim
+    status; core.thesis.compute_verdict derives the thesis-level
+    verdict from these. If she were asked for the verdict directly she
+    could return "strengthened" while these same notes said two
+    load-bearing claims were failing, and nothing would catch the
+    contradiction.
+    """
+
+    claim: str
+    status: Literal["holding", "improving", "strained", "broken", "unchecked"]
+    evidence: str = ""
+
+
 class PositionMonitoring(BaseModel):
     ticker: str
     status: Literal["intact", "at_risk", "broken"]
     trigger: Literal["none", "earnings", "news", "fundamental_drift", "macro_conflict", "profit_target_sustained"]
     reasoning: str
     conviction_score: int  # 1-5, compared against the thesis's original score
+    # One entry per open assumption on this thesis. Empty for a thesis
+    # that has none yet — which yields NO verdict rather than a
+    # flattering default.
+    assumption_checks: list[AssumptionCheckOut] = Field(default_factory=list)
 
 
 class NewCandidateOutput(BaseModel):
@@ -186,6 +226,52 @@ class NewCandidateOutput(BaseModel):
 # =================================================================
 # [1] ROLE / MANDATE — monitoring job
 # =================================================================
+ASSUMPTIONS_SYSTEM_PROMPT = """You are Vera, the Equity Research agent at MBY-Trading.
+
+You are being asked to do something you do ONCE per thesis: write down
+what it actually rests on.
+
+A thesis written as prose can never be wrong — it just stops being
+mentioned. Your job here is to turn one into a short list of CLAIMS
+that can be checked, and specifically that can be shown to be FALSE.
+
+For each claim:
+- State it as something that is either true or not. "Cloud growth
+  stays above 20%" is a claim. "Strong competitive position" is not.
+- Name the METRIC that bears on it, if there is one, and which
+  DIRECTION supports the claim.
+- State what would FALSIFY it. Be specific enough that someone
+  reading this in a year can tell whether it happened. "Growth slows"
+  is useless; "two consecutive quarters below 15%" is a threshold.
+  If the claim is genuinely not numeric, describe the observable
+  event instead — vague is the only failure here, not non-numeric.
+- Mark whether it is LOAD-BEARING: does the thesis die without it? Be
+  honest and be sparing. If everything is load-bearing, nothing is,
+  and the first minor disappointment will read as the thesis being
+  broken.
+
+Write THREE TO SIX claims. Fewer than three and you have not decomposed
+the thesis; more than six and you are listing everything you know about
+the company rather than what the investment depends on.
+
+Do not re-argue the thesis, do not rate it, and do not recommend
+anything. You are recording its structure.
+
+Respond with ONLY a JSON array — your response must start with "["
+as its very first character and contain nothing else:
+
+[
+  {
+    "claim": "a statement that can be true or false",
+    "metric": "what to watch, or null",
+    "direction": "up | down | stable, or null",
+    "falsify_threshold": "what would settle this against us, specifically",
+    "is_load_bearing": true
+  }
+]
+"""
+
+
 MONITORING_SYSTEM_PROMPT = """You are Vera, the Equity Research agent at MBY-Trading.
 
 This is your MONITORING pass. You are reviewing positions the firm
@@ -234,6 +320,30 @@ Other rules:
 - If nothing has changed for a position, say so plainly — "status
   intact, no new information" is a completely valid, expected answer.
 
+THE ASSUMPTIONS. Each position is shown with the numbered claims its
+thesis rests on. Return a status for EVERY claim listed, using its
+exact wording so it can be matched:
+
+    holding     still true; nothing has moved against it
+    improving   evidence moved in its favour beyond what was claimed
+    strained    moved against it, but NOT past its stated threshold
+    broken      past its stated threshold
+
+    unchecked   no information bearing on it arrived today
+
+`unchecked` is the honest answer most days for most claims, and it is
+expected — a quarterly metric does not move on a Tuesday. Do not
+report `holding` for a claim you have no new information about:
+"nothing arrived" and "I verified it and it holds" are different
+statements, and the difference is the point.
+
+`broken` requires the claim to have passed the threshold WRITTEN IN
+IT, not your general sense that things look worse. If it moved against
+the claim but has not passed the threshold, that is `strained`.
+
+DO NOT return an overall verdict on the thesis. That is computed from
+these statuses, deliberately not asked of you.
+
 Once you've reviewed every position given to you, respond with ONLY
 a JSON array — your response must start with "[" as its very first
 character and contain nothing else: no headers, no "notes" sections,
@@ -247,6 +357,11 @@ result, matching exactly this shape:
     "status": "intact | at_risk | broken",
     "trigger": "none | earnings | news | fundamental_drift | macro_conflict | profit_target_sustained",
     "reasoning": "1-3 sentences — explain WHY, referencing the market comparison or trend data you were given",
+    "assumption_checks": [
+      {"claim": "exact wording of the claim as shown to you",
+       "status": "holding | improving | strained | broken | unchecked",
+       "evidence": "what moved it, or empty if unchecked"}
+    ],
     "conviction_score": 1-5
   }
 ]
@@ -481,6 +596,130 @@ def _get_trailing_pnl_history(session, today: date, tickers: list[str], days: in
     return history
 
 
+# =================================================================
+# ASSUMPTIONS — authored once per thesis, checked every day
+#
+# WHY THE AUTHORING IS SEPARATE FROM THE CHECKING. They have different
+# cadences and different mandates. Writing down what a thesis rests on
+# is a one-time act of decomposition; checking those claims is a daily
+# comparison. Folding both into the monitoring prompt would make it
+# conditional on whether the thesis happened to have assumptions yet,
+# and a prompt that does two jobs depending on database state is how
+# you get a model doing neither well.
+#
+# It also means the cost is where it belongs. Authoring is a handful
+# of calls, ever. Checking is the daily work.
+# =================================================================
+def open_assumptions(session, thesis_id: int) -> list[ThesisAssumption]:
+    return (
+        session.query(ThesisAssumption)
+        .filter(ThesisAssumption.thesis_id == thesis_id,
+                ThesisAssumption.retired_date.is_(None))
+        .order_by(ThesisAssumption.id)
+        .all()
+    )
+
+
+def author_assumptions(today: date, thesis: Thesis) -> list[dict]:
+    """Decompose a thesis into checkable claims. Called ONCE per
+    thesis — the first monitoring pass after it opens.
+
+    This is also what retro-fits the theses that predate migration
+    011. They were adopted as orphans with no structure behind them,
+    and until they have claims they report no verdict at all, which is
+    honest but useless. The first run after this ships gives them one.
+    """
+    prompt = (
+        f"Ticker: {thesis.ticker}\n"
+        f"Opened: {thesis.opened_date}\n"
+        f"Conviction at open: {thesis.original_conviction}\n"
+        f"Catalyst: {thesis.catalyst or 'none recorded'}\n\n"
+        f"The thesis, as written:\n{thesis.thesis_text}"
+    )
+    if thesis.key_risks:
+        prompt += f"\n\nRisks recorded at open: {thesis.key_risks}"
+
+    raw = run_agent_loop(
+        system_prompt=ASSUMPTIONS_SYSTEM_PROMPT,
+        user_prompt=prompt,
+        tools=VERA_TOOLS,
+        tool_executor=execute_tool,
+        max_tokens=2000,
+    )
+    authored = [AssumptionOut.model_validate(item) for item in extract_json(raw)]
+
+    with session_scope() as session:
+        existing = {a.claim for a in open_assumptions(session, thesis.id)}
+        for a in authored:
+            if a.claim in existing:
+                continue  # UNIQUE (thesis_id, claim) — a rerun must not duplicate
+            session.add(ThesisAssumption(
+                thesis_id=thesis.id,
+                claim=a.claim,
+                metric=a.metric,
+                direction=a.direction,
+                falsify_threshold=a.falsify_threshold,
+                is_load_bearing=a.is_load_bearing,
+                status="holding",
+                opened_date=today,
+            ))
+    logger.info("Authored %s assumption(s) for %s (thesis %s).",
+                len(authored), thesis.ticker, thesis.id)
+    return [a.model_dump() for a in authored]
+
+
+def _format_assumptions(assumptions: list[ThesisAssumption]) -> str:
+    """The claims, numbered, for the monitoring prompt. Exact wording
+    is echoed back by the model so checks can be matched to rows."""
+    if not assumptions:
+        return "  (no assumptions on record for this thesis yet)"
+    lines = []
+    for i, a in enumerate(assumptions, 1):
+        bits = [f"  {i}. {a.claim}"]
+        if a.metric:
+            bits.append(f"     metric: {a.metric}"
+                        + (f" ({a.direction} supports it)" if a.direction else ""))
+        if a.falsify_threshold:
+            bits.append(f"     falsified if: {a.falsify_threshold}")
+        bits.append(f"     load-bearing: {'yes' if a.is_load_bearing else 'no'}"
+                    f" | last status: {a.status}")
+        lines.append("\n".join(bits))
+    return "\n".join(lines)
+
+
+def _match_checks(assumptions: list[ThesisAssumption],
+                  reported: list) -> tuple[list[AssumptionCheck], list[str]]:
+    """Pair the model's reported statuses to the stored claims.
+
+    Matching is on exact claim text, which is why the prompt asks for
+    it verbatim. A claim the model did not report becomes `unchecked`
+    rather than being dropped: silently omitting a claim would shrink
+    the denominator and make a thesis look better verified than it was.
+
+    Returns (checks, unmatched) — `unmatched` is anything the model
+    reported that does not correspond to a stored claim, which is
+    reported rather than ignored because it usually means the wording
+    drifted and the next day's match will fail the same way.
+    """
+    by_claim = {r.claim: r for r in reported}
+    checks, used = [], set()
+    for a in assumptions:
+        r = by_claim.get(a.claim)
+        if r is not None:
+            used.add(a.claim)
+            checks.append(AssumptionCheck(
+                claim=a.claim, status=r.status,
+                is_load_bearing=a.is_load_bearing,
+                evidence=r.evidence, assumption_id=a.id))
+        else:
+            checks.append(AssumptionCheck(
+                claim=a.claim, status="unchecked",
+                is_load_bearing=a.is_load_bearing,
+                evidence="", assumption_id=a.id))
+    unmatched = [c for c in by_claim if c not in used]
+    return checks, unmatched
+
+
 def _format_position_block(thesis: Thesis, position, history: list[dict], policy) -> str:
     """Builds one position's block of context for the monitoring
     prompt — current P&L, trailing trend, and the review thresholds."""
@@ -613,6 +852,11 @@ def run(today: date, atlas_output: dict) -> dict:
     # the number Solomon gates on.
     fmp_client.coverage.reset()
 
+    # Populated by the monitoring pass; empty on a day with nothing held.
+    authored_assumptions: dict = {}
+    verdicts: dict = {}
+    assumptions_by_thesis: dict = {}
+
     with session_scope() as session:
         open_theses = get_open_theses(session)
         held_tickers = [t.ticker for t in open_theses]
@@ -621,13 +865,42 @@ def run(today: date, atlas_output: dict) -> dict:
     # JOB 1: MONITORING — [4] first agentic loop
     # -------------------------------------------------------------
     if open_theses:
+        # ---------------------------------------------------------
+        # Any open thesis with no claims on record gets them now.
+        # One-time per thesis, and the mechanism that retro-fits the
+        # theses adopted as orphans before migration 011 — until they
+        # have claims they report no verdict at all.
+        # ---------------------------------------------------------
+        for t in open_theses:
+            with session_scope() as session:
+                has_claims = bool(open_assumptions(session, t.id))
+            if not has_claims:
+                try:
+                    authored_assumptions[t.ticker] = author_assumptions(today, t)
+                except Exception as exc:  # noqa: BLE001
+                    # A thesis without claims still gets monitored the
+                    # old way and simply reports no verdict. Failing
+                    # the whole monitoring pass because one
+                    # decomposition call failed would be a much worse
+                    # trade than losing one thesis's structure today.
+                    logger.warning("Could not author assumptions for %s: %s. "
+                                   "It will be monitored without a verdict.",
+                                   t.ticker, exc)
+
         with session_scope() as session:
             policy = get_active_risk_policy_for_review(session, today)
             positions_by_ticker = {p.ticker: p for p in session.query(Position).all()}
             trailing_history = _get_trailing_pnl_history(session, today, [t.ticker for t in open_theses])
+            # Read here and used after the scope closes, which is safe
+            # because SessionLocal is built with expire_on_commit=False
+            # — the column values stay loaded on the instances. Anyone
+            # changing that setting in core/db.py breaks this.
+            assumptions_by_thesis = {t.id: open_assumptions(session, t.id) for t in open_theses}
 
-        positions_summary = "\n".join(
+        positions_summary = "\n\n".join(
             _format_position_block(t, positions_by_ticker.get(t.ticker), trailing_history.get(t.ticker, []), policy)
+            + "\n  Assumptions this thesis rests on:\n"
+            + _format_assumptions(assumptions_by_thesis.get(t.id, []))
             for t in open_theses
         )
 
@@ -711,14 +984,48 @@ def run(today: date, atlas_output: dict) -> dict:
     with session_scope() as session:
         thesis_by_ticker = {t.ticker: t.id for t in open_theses}
         for m in monitoring_results:
+            thesis_id = thesis_by_ticker[m.ticker]
+            stored = assumptions_by_thesis.get(thesis_id, [])
+
+            # THE VERDICT, COMPUTED. Vera reported a status per claim;
+            # this derives what that means for the thesis. She is never
+            # asked for the verdict itself, so it cannot contradict its
+            # own evidence.
+            checks, unmatched = _match_checks(stored, m.assumption_checks)
+            if unmatched:
+                # Usually the wording drifted, and tomorrow's match
+                # will fail the same way — so it is reported rather
+                # than swallowed.
+                logger.warning(
+                    "%s: %s reported check(s) matched no stored claim: %s. "
+                    "The claim text must be echoed verbatim for matching.",
+                    m.ticker, len(unmatched), "; ".join(unmatched))
+            v = compute_verdict(checks)
+            verdicts[m.ticker] = {
+                "verdict": v.verdict, "reason": v.reason,
+                "checked": v.checked, "total": v.total,
+                "broken": v.broken_claims, "strained": v.strained_claims,
+                "improved": v.improved_claims,
+                "unmatched": unmatched,
+            }
+            logger.info("%s — %s", m.ticker, v.describe())
+
+            checks_json = [
+                {"claim": c.claim, "status": c.status,
+                 "is_load_bearing": c.is_load_bearing, "evidence": c.evidence}
+                for c in checks
+            ] or None
+
             stmt = pg_insert(PositionMonitoringLog).values(
                 log_date=today,
-                thesis_id=thesis_by_ticker[m.ticker],
+                thesis_id=thesis_id,
                 ticker=m.ticker,
                 status=m.status,
                 trigger=m.trigger,
                 reasoning=m.reasoning,
                 conviction_score=m.conviction_score,
+                verdict=v.verdict,
+                assumption_checks=checks_json,
             )
             stmt = stmt.on_conflict_do_update(
                 index_elements=["log_date", "thesis_id"],
@@ -727,9 +1034,29 @@ def run(today: date, atlas_output: dict) -> dict:
                     "trigger": stmt.excluded.trigger,
                     "reasoning": stmt.excluded.reasoning,
                     "conviction_score": stmt.excluded.conviction_score,
+                    "verdict": stmt.excluded.verdict,
+                    "assumption_checks": stmt.excluded.assumption_checks,
                 },
             )
             session.execute(stmt)
+
+            # Carry each claim's status forward. The daily observation
+            # lives on the log; this is the CURRENT state, which is
+            # what tomorrow's prompt shows as "last status".
+            for c in checks:
+                if c.assumption_id is None or c.status == "unchecked":
+                    # An unchecked claim keeps the status it had. Writing
+                    # `unchecked` here would erase the last real
+                    # observation and make every quiet day look like a
+                    # gap in the record.
+                    continue
+                (
+                    session.query(ThesisAssumption)
+                    .filter(ThesisAssumption.id == c.assumption_id)
+                    .update({"status": c.status, "evidence": c.evidence,
+                             "last_checked": today},
+                            synchronize_session=False)
+                )
 
         # Delete today's prior candidates before reinserting — a
         # same-day rerun should REPLACE today's screening results,
@@ -802,6 +1129,12 @@ def run(today: date, atlas_output: dict) -> dict:
         # agent_runs.raw_output, which is JSONB and therefore
         # queryable later for the best_conviction trend. No migration.
         "screening": screening,
+        # What today did to each open thesis, computed from the
+        # per-claim checks rather than asked of the model.
+        "verdicts": verdicts,
+        # Claims written for a thesis that had none — one-time per
+        # thesis, so this is empty on almost every day.
+        "authored_assumptions": authored_assumptions,
         # Her read on the names that did not clear the bar. Kept in the
         # run ledger only, never written to new_candidates — a row
         # there is a name the firm is putting forward, and these are

@@ -82,6 +82,13 @@ class MacroBrief(Base):
     key_events: Mapped[Optional[dict]] = mapped_column(JSONB)
     notable_moves: Mapped[Optional[dict]] = mapped_column(JSONB)
     narrative: Mapped[Optional[str]]
+    # Which theme links repriced off which bellwether today — see
+    # migration 013 and core/theme.py. Structured rather than folded
+    # into the narrative because its whole purpose is to be joined to
+    # a position's own move later: "memory fell because the compute
+    # bellwether guided down" is the difference between a link
+    # repricing and a thesis breaking, and prose cannot be joined.
+    read_across: Mapped[Optional[dict]] = mapped_column(JSONB)
 
 
 # ============================================================
@@ -130,6 +137,58 @@ class PositionMonitoringLog(Base):
     trigger: Mapped[Optional[str]]
     reasoning: Mapped[Optional[str]]
     conviction_score: Mapped[Optional[int]]
+    # What today did to the thesis — see migration 011. COMPUTED by
+    # core.thesis.compute_verdict from assumption_checks, never asked
+    # of the model: otherwise it could return 'strengthened' while its
+    # own per-claim notes said two load-bearing claims were failing.
+    # strengthened | unchanged | weakened | broken. None where the
+    # thesis has no assumptions on record — no verdict, deliberately
+    # not 'unchanged'.
+    #
+    # `status` SURVIVES ALONGSIDE IT. A status is a state (where the
+    # thesis stands); a verdict is a movement (what today did). They
+    # can legitimately disagree — at_risk and strengthened together is
+    # a thesis that was in trouble and got better.
+    verdict: Mapped[Optional[str]]
+    assumption_checks: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+
+class ThesisAssumption(Base):
+    """
+    The named claims a thesis rests on — migration 011.
+
+    This is what makes a thesis checkable rather than re-arguable. The
+    monitoring pass compares new information against these rows instead
+    of re-reading `theses.thesis_text`, which is a paragraph and cannot
+    be diffed against anything.
+
+    A row is RETIRED, never deleted: it records what the desk believed
+    when it committed capital, and deleting it would erase the reason a
+    position was opened.
+    """
+    __tablename__ = "thesis_assumptions"
+    __table_args__ = (UniqueConstraint("thesis_id", "claim"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    thesis_id: Mapped[int] = mapped_column(ForeignKey("theses.id"))
+    claim: Mapped[str]
+    metric: Mapped[Optional[str]]
+    direction: Mapped[Optional[str]]          # up | down | stable
+    # TEXT, not numeric. The claims that matter are not all numeric —
+    # "management keeps buying back stock below intrinsic value" has no
+    # threshold expressible as a number, and forcing one would either
+    # exclude the claim or invite a fabricated figure. The requirement
+    # is specificity a later reader can judge.
+    falsify_threshold: Mapped[Optional[str]]
+    # Does the thesis die without this claim? Without the flag, one
+    # broken minor assumption sinks a thesis and within a month every
+    # thesis reads 'broken' for reasons nobody considered material.
+    is_load_bearing: Mapped[bool] = mapped_column(default=True)
+    status: Mapped[str] = mapped_column(default="holding")
+    evidence: Mapped[Optional[str]]
+    opened_date: Mapped[date]
+    last_checked: Mapped[Optional[date]]
+    retired_date: Mapped[Optional[date]]
 
 
 class NewCandidate(Base):
@@ -429,3 +488,55 @@ class DailyReport(Base):
     report_date: Mapped[date] = mapped_column(primary_key=True)
     executive_summary: Mapped[Optional[str]]
     full_report_md: Mapped[str]
+
+
+# ============================================================
+# Fundamentals from the filings (migration 012)
+# ============================================================
+class CompanyFact(Base):
+    """
+    One figure as reported to the SEC, from EDGAR XBRL companyfacts.
+
+    APPEND-ONLY IN EFFECT. `accession` is part of the unique key, so a
+    restated period lands as a NEW ROW beside the original rather than
+    overwriting it. Companies restate, and a restatement is a different
+    claim about the same past rather than a typo fix — if it overwrote,
+    a thesis formed on the original figure would reference a number the
+    database no longer holds, and calibration would grade that thesis
+    against facts nobody had at the time. "The current figure" is
+    therefore a query (latest filed_date) rather than a mutable row —
+    see core.clients.edgar_client.latest_per_period.
+
+    NO SEGMENT DETAIL. companyfacts carries consolidated figures with
+    no dimensional breakdown. Segment revenue and segment margins need
+    the filing's own XBRL instance or its text, which is a different
+    job with a different cost.
+    """
+    __tablename__ = "company_facts"
+    __table_args__ = (
+        UniqueConstraint("cik", "taxonomy", "tag", "unit",
+                         "period_end", "accession"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # Both: cik is EDGAR's stable identity and survives a ticker
+    # change, ticker is what the rest of this schema joins on.
+    cik: Mapped[str]
+    ticker: Mapped[str]
+    taxonomy: Mapped[str] = mapped_column(default="us-gaap")
+    # The XBRL concept as reported, unmapped. Translation to the desk's
+    # own vocabulary lives in core/fundamentals.py — a mapping here
+    # would be a second source of truth to keep in step with a taxonomy
+    # we do not control.
+    tag: Mapped[str]
+    unit: Mapped[str]
+    fiscal_year: Mapped[Optional[int]]
+    fiscal_period: Mapped[Optional[str]]      # FY | Q1..Q4
+    period_start: Mapped[Optional[date]]
+    period_end: Mapped[date]
+    value: Mapped[Decimal]
+    form: Mapped[Optional[str]]               # 10-K | 10-Q | 20-F ...
+    filed_date: Mapped[date]
+    accession: Mapped[str]
+    fetched_at: Mapped[Optional[datetime]] = mapped_column(
+        server_default=text("now()"))

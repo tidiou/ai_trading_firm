@@ -46,6 +46,7 @@ something Nora rejected, or execute — there is no execution tool on
 his menu, same pattern as everyone before him.
 """
 
+import logging
 from datetime import date
 from typing import Literal, Optional
 
@@ -57,8 +58,10 @@ from core.clients.claude_client import run_agent_loop, extract_json
 from core.db import session_scope
 from core.models import (
     ProposalReview, Proposal, StrategyDecision, NewCandidate,
-    PositionMonitoringLog, Position, Allocation,
+    PositionMonitoringLog, Position, Allocation, Thesis,
 )
+
+logger = logging.getLogger(__name__)
 
 # Marcus-owned constant — a portfolio-construction discipline, NOT
 # one of Nora's hard risk limits (those live in risk_policy_versions,
@@ -168,6 +171,87 @@ def _get_conviction_for_ticker(session, today: date, ticker: str) -> int:
     return monitoring.conviction_score if monitoring else 3  # conservative default
 
 
+def open_thesis_if_needed(session, today: date, ticker: str) -> Optional[int]:
+    """Open a thesis for a name the desk has just committed to.
+
+    WHY HERE. Until now `theses` was written in exactly one place in
+    the whole codebase — Vera's orphan-adoption path. Nothing in the
+    pipeline opened one, so every thesis on record existed because a
+    position turned up UNEXPLAINED and was adopted after the fact with
+    `original_conviction = r.conviction_score or 3`: a conviction
+    invented at adoption time while the real one sat in new_candidates
+    from days earlier. Daily monitoring therefore only covered adopted
+    orphans, and attribution.thesis_id was null for everything else.
+
+    An allocation is the right moment because a thesis is a DECISION
+    artefact, not a holding one. It records that the desk chose to
+    believe something, which is exactly what an allocation is — and the
+    conviction and thesis text are right here, in the candidate row
+    that caused it, so nothing has to be invented.
+
+    A thesis whose order never fills is not a defect of this. It is the
+    record that makes unfilled opportunity cost measurable: the desk
+    decided, and the market did not fill it.
+
+    MECHANICAL ONLY — no model call. Marcus sizes; he does not author
+    investment theses, and asking him to write a falsification list
+    would be a mandate violation. Vera attaches assumptions on her next
+    monitoring pass for any open thesis that has none.
+
+    Returns the thesis id, or None when there was nothing to open.
+    """
+    existing = (
+        session.query(Thesis)
+        .filter(Thesis.ticker == ticker, Thesis.closed_date.is_(None))
+        .first()
+    )
+    if existing:
+        # Idempotent: an `add` to a name already held must not open a
+        # second thesis, and a same-day rerun must not either.
+        return existing.id
+
+    candidate = (
+        session.query(NewCandidate)
+        .filter(NewCandidate.candidate_date == today, NewCandidate.ticker == ticker)
+        .first()
+    )
+    if candidate is None:
+        # No candidate behind this allocation. Deliberately does NOT
+        # fabricate a thesis: an allocation with no research behind it
+        # is a process-compliance finding for Clara to raise, not
+        # something to paper over with invented text. Vera's orphan
+        # review remains the backstop for the position itself.
+        logger.warning(
+            "No candidate row for %s on %s — not opening a thesis. An "
+            "allocation with no research behind it is a compliance "
+            "finding, not something to invent a thesis for.", ticker, today)
+        return None
+
+    thesis = Thesis(
+        ticker=ticker,
+        opened_date=today,
+        thesis_text=candidate.thesis,
+        catalyst=candidate.catalyst,
+        # The conviction Vera actually scored, not a default.
+        original_conviction=candidate.conviction_score or 3,
+        valuation_snapshot=candidate.valuation_snapshot,
+        key_risks=candidate.key_risks,
+        sector=candidate.sector,
+        # Migration 010's prediction, carried across so the thesis is
+        # gradeable from the day it opens rather than from whenever
+        # someone remembers to fill it in.
+        expected_direction=candidate.expected_direction,
+        expected_move_pct=candidate.expected_move_pct,
+        horizon_days=candidate.horizon_days,
+    )
+    session.add(thesis)
+    session.flush()  # populate thesis.id without ending the transaction
+    logger.info("Opened thesis %s for %s (conviction %s) from the candidate "
+                "that caused the allocation.",
+                thesis.id, ticker, thesis.original_conviction)
+    return thesis.id
+
+
 def _get_latest_status(session, ticker: str) -> Optional[str]:
     """The at-risk guardrail check needs Vera's most recent verdict on this ticker."""
     monitoring = (
@@ -219,6 +303,7 @@ def run(today: date) -> dict:
             if breaker_active and proposal.action in ("new_position", "add"):
                 base_allocations.append({
                     "ticker": proposal.ticker, "action": proposal.action,
+                "proposal_review_id": review.id,
                     "base_size_pct": 0.0, "ceiling_pct": 0.0,
                     "existing_pct": 0.0, "headroom_pct": 0.0,
                     "conviction": None,
@@ -240,6 +325,7 @@ def run(today: date) -> dict:
                 target = 0.0 if proposal.action == "exit" else round(existing_weight * 0.5, 2)
                 base_allocations.append({
                     "ticker": proposal.ticker, "action": proposal.action,
+                "proposal_review_id": review.id,
                     "base_size_pct": target, "ceiling_pct": None,
                     "existing_pct": existing_weight, "headroom_pct": None,
                     "conviction": None, "blocked_reason": None,
@@ -255,6 +341,7 @@ def run(today: date) -> dict:
                 # Manual states this rule.
                 base_allocations.append({
                     "ticker": proposal.ticker, "action": proposal.action,
+                "proposal_review_id": review.id,
                     "base_size_pct": 0.0, "ceiling_pct": float(review.max_size_pct or 0),
                     "existing_pct": 0.0, "headroom_pct": 0.0,
                     "conviction": None,
@@ -279,6 +366,7 @@ def run(today: date) -> dict:
 
             base_allocations.append({
                 "ticker": proposal.ticker, "action": proposal.action,
+                "proposal_review_id": review.id,
                 "base_size_pct": base_size, "ceiling_pct": ceiling,
                 "existing_pct": existing_weight, "headroom_pct": headroom,
                 "conviction": conviction, "blocked_reason": None,
@@ -324,6 +412,7 @@ def run(today: date) -> dict:
     # Claude said. This is the wall around Claude's room to adjust.
     # -------------------------------------------------------
     final_allocations = []
+    opened_theses = []
     for a in base_allocations:
         if a["blocked_reason"]:
             final_allocations.append({
@@ -350,6 +439,7 @@ def run(today: date) -> dict:
         clamped = max(a["existing_pct"], min(claude_size, a["ceiling_pct"]))
         final_allocations.append({
             "ticker": a["ticker"], "action": a["action"], "target_size_pct": round(clamped, 2),
+            "proposal_review_id": a.get("proposal_review_id"),
             "conviction_input": a["conviction"],
             "rationale": adj.rationale if adj else (
                 f"Base conviction-tier size; total target {a['base_size_pct']}% "
@@ -366,8 +456,26 @@ def run(today: date) -> dict:
     with session_scope() as session:
         session.query(Allocation).filter(Allocation.allocation_date == today).delete()
         for a in final_allocations:
+            # A thesis is opened here, for the reasons in
+            # open_thesis_if_needed. Only for a new_position: an `add`
+            # already has one, and a trim or exit is a reduction of
+            # something the desk already believes.
+            thesis_id = None
+            if a["action"] == "new_position":
+                thesis_id = open_thesis_if_needed(session, today, a["ticker"])
+                if thesis_id is not None:
+                    opened_theses.append({"ticker": a["ticker"], "thesis_id": thesis_id})
+
             session.add(Allocation(
                 allocation_date=today,
+                # Carried at last. The column has existed since the
+                # first schema and was never populated, so the chain
+                # allocation -> proposal_review -> proposal ->
+                # new_candidates could not be walked: an allocation
+                # could not be traced back to the research that caused
+                # it, which is precisely what Clara's compliance audit
+                # is supposed to verify.
+                proposal_review_id=a.get("proposal_review_id"),
                 ticker=a["ticker"],
                 action=a["action"],
                 target_size_pct=a["target_size_pct"],
@@ -376,7 +484,11 @@ def run(today: date) -> dict:
                 priority=a["priority"],
             ))
 
-    return {"date": today, "allocations": final_allocations, "cash_reserve_pct": MIN_CASH_RESERVE_PCT}
+    return {"date": today, "allocations": final_allocations,
+            "cash_reserve_pct": MIN_CASH_RESERVE_PCT,
+            # What the desk newly committed to believing today. Empty
+            # on every ordinary day, which is the expected shape.
+            "opened_theses": opened_theses}
 
 
 if __name__ == "__main__":

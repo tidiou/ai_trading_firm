@@ -142,8 +142,52 @@ CREATE TABLE IF NOT EXISTS position_monitoring_log (
     trigger           TEXT,            -- none|earnings|news|fundamental_drift|macro_conflict
     reasoning         TEXT,
     conviction_score  SMALLINT CHECK (conviction_score BETWEEN 1 AND 5),
+    -- What today did to the thesis (migration 011). COMPUTED by
+    -- core.thesis.compute_verdict from assumption_checks, never asked
+    -- of the model — otherwise it could report `strengthened` while
+    -- its own per-claim notes said load-bearing claims were failing.
+    -- NULL where the thesis has no assumptions: no verdict, and
+    -- deliberately not `unchanged`.
+    verdict           TEXT CHECK (verdict IN ('strengthened', 'unchanged',
+                                              'weakened', 'broken')),
+    -- What each assumption did on this date. The verdict is derivable
+    -- from this, so a stored verdict can always be re-checked against
+    -- its own inputs.
+    assumption_checks JSONB,
     UNIQUE (log_date, thesis_id)
 );
+
+-- The named claims a thesis rests on (migration 011) — what makes it
+-- checkable rather than re-arguable every morning. Retired, never
+-- deleted: this is the record of what the desk believed when it
+-- committed capital.
+CREATE TABLE IF NOT EXISTS thesis_assumptions (
+    id                BIGSERIAL PRIMARY KEY,
+    thesis_id         BIGINT NOT NULL REFERENCES theses(id),
+    claim             TEXT NOT NULL,
+    metric            TEXT,
+    direction         TEXT CHECK (direction IN ('up', 'down', 'stable')),
+    -- TEXT rather than numeric: the claims that matter are not all
+    -- numeric, and forcing a number would either exclude the claim or
+    -- invite a fabricated one. The requirement is specificity a later
+    -- reader can judge.
+    falsify_threshold TEXT,
+    -- Does the thesis die without this? Only a load-bearing failure
+    -- gives a `broken` verdict; anything else is `weakened`. Without
+    -- the flag, one broken minor claim sinks a thesis.
+    is_load_bearing   BOOLEAN NOT NULL DEFAULT TRUE,
+    status            TEXT NOT NULL DEFAULT 'holding'
+                      CHECK (status IN ('holding', 'improving', 'strained',
+                                        'broken', 'unchecked')),
+    evidence          TEXT,
+    opened_date       DATE NOT NULL,
+    last_checked      DATE,
+    retired_date      DATE,
+    UNIQUE (thesis_id, claim)
+);
+
+CREATE INDEX IF NOT EXISTS idx_thesis_assumptions_open
+    ON thesis_assumptions (thesis_id) WHERE retired_date IS NULL;
 
 -- New candidates surfaced that day (zero rows is a normal day).
 CREATE TABLE IF NOT EXISTS new_candidates (
@@ -515,3 +559,42 @@ CREATE TRIGGER trading_control_no_truncate
 CREATE INDEX IF NOT EXISTS idx_position_monitoring_date ON position_monitoring_log(log_date);
 CREATE INDEX IF NOT EXISTS idx_transactions_ticker_date ON transactions(ticker, transaction_date);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_date_status ON agent_runs(run_date, status);
+
+
+-- ============================================================
+-- FUNDAMENTALS FROM THE FILINGS (migration 012)
+-- ============================================================
+
+-- Consolidated figures as reported to the SEC, from EDGAR XBRL.
+--
+-- APPEND-ONLY IN EFFECT: `accession` is part of the unique key, so a
+-- restated period arrives as a new row beside the original instead of
+-- overwriting it. A restatement is a different claim about the same
+-- past, not a typo fix — if it overwrote, a thesis formed on the
+-- original figure would reference a number this database no longer
+-- holds. Same reasoning as corrections on `transactions`.
+--
+-- NO SEGMENT DETAIL: companyfacts carries no dimensional breakdown.
+CREATE TABLE IF NOT EXISTS company_facts (
+    id            BIGSERIAL PRIMARY KEY,
+    cik           TEXT NOT NULL,
+    ticker        TEXT NOT NULL,
+    taxonomy      TEXT NOT NULL DEFAULT 'us-gaap',
+    tag           TEXT NOT NULL,
+    unit          TEXT NOT NULL,
+    fiscal_year   INTEGER,
+    fiscal_period TEXT,
+    period_start  DATE,
+    period_end    DATE NOT NULL,
+    value         NUMERIC(24,4) NOT NULL,
+    form          TEXT,
+    filed_date    DATE NOT NULL,
+    accession     TEXT NOT NULL,
+    fetched_at    TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (cik, taxonomy, tag, unit, period_end, accession)
+);
+
+CREATE INDEX IF NOT EXISTS idx_company_facts_series
+    ON company_facts (ticker, tag, period_end DESC, filed_date DESC);
+CREATE INDEX IF NOT EXISTS idx_company_facts_accession
+    ON company_facts (accession);
