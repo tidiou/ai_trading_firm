@@ -356,6 +356,28 @@ def compute_performance(nav_series: list[tuple[date, float]],
     else:
         w = 1.0
 
+    # THE CONVENTION, STATED BECAUSE IT IS EASY TO MISREAD.
+    #
+    # `cash_drag` is a COST, carrying its own sign, and the identity is
+    # SUBTRACTION:
+    #
+    #     active = selection - cash_drag
+    #
+    # So a POSITIVE cash_drag is a penalty (cash held while the index
+    # rose) and a NEGATIVE cash_drag is a benefit (cash held while the
+    # index fell). On 2026-09-17 the report read "cash drag -0.30pp",
+    # which under this convention means being 94% in cash HELPED by
+    # 0.30pp — and it was the whole reason the desk beat the index.
+    #
+    # Read as an additive term it looks like a sign error, and it is
+    # not: TestDecomposition in tests/test_benchmark.py pins
+    # `selection - cash_drag == active` at every exposure from 0 to 1,
+    # in both market directions. If you are about to "fix" the sign
+    # here, read those tests first.
+    #
+    # What IS worth improving is the wording in describe(): "cash drag
+    # -0.30pp" is a confusing way to say "cash helped by 0.30pp".
+    # That is a labelling change, not an arithmetic one.
     selection = desk - w * bench
     cash_drag = (1 - w) * bench
 

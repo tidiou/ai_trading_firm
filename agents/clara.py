@@ -46,16 +46,19 @@ worth tightening once Ada is revisited. Flagged, not hidden.
 from datetime import date
 
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from core.clients.claude_client import run_agent_loop, extract_json
 from core.benchmark import BENCHMARK_TICKER, performance_since_inception
 from core.db import session_scope
 from core.logging_utils import load_agent_output
+from core.market_calendar import trading_days_between
 from core.models import (
     Order, Allocation, ProposalReview, Proposal, StrategyDecision,
-    Position, PositionMonitoringLog, DailyPnl, Attribution, ProcessCheck,
-    DailyReport, MacroBrief, NewCandidate, RiskReview,
+    Position, PositionMonitoringLog, PositionPnlHistory, DailyPnl,
+    Attribution, ProcessCheck, DailyReport, MacroBrief, NewCandidate,
+    RiskReview,
 )
 
 
@@ -171,23 +174,160 @@ def compute_performance(today: date) -> dict:
     }
 
 
+# =================================================================
+# ATTRIBUTION — A DAILY FLOW OVER A DAILY FLOW
+#
+# THE BUG THIS REPLACES, because it is worth naming precisely. The
+# numerator used to be `positions.unrealized_pnl`, which is the
+# position's LIFETIME open gain — a stock. The denominator was
+# `daily_pnl.total_pnl`, today's move — a flow. Dividing one by the
+# other produces a number with no meaning that nonetheless looks like
+# a percentage: on 2026-09-17 it reported AAPL at +31.08% and NVDA at
+# -188.48% of a day's P&L, which sum to -157% rather than 100%.
+#
+# `agents/otis.py` fixed this exact confusion on its own side and its
+# docstring says so — "subtracting a cumulative stock from a daily
+# flow ... and it fed Clara's attribution". The upstream half was
+# repaired; the sentence named the downstream consumer and nobody
+# followed through. This is that follow-through.
+#
+# THE NUMERATOR IS NOW THE POSITION'S CHANGE SINCE THE PREVIOUS
+# SNAPSHOT, derived from position_pnl_history. And it REFUSES rather
+# than approximating in three cases, because each of them would
+# reproduce the same class of error in a new disguise:
+#
+#   1. The prior snapshot is not the previous session. A twelve-day
+#      change over a one-day denominator is the original bug wearing
+#      a different hat — and it is exactly the state the desk was in
+#      last night, with snapshots on the 5th and the 17th.
+#   2. A position has no prior snapshot at all (opened today). Its
+#      day's move is real but is not a change in an open position,
+#      and treating absence as zero would credit it with nothing.
+#   3. Today's P&L is zero. A share of zero is undefined, not 0%.
+#
+# The dollar figure is reported alongside the percentage and is
+# available in every case where the change itself is computable,
+# because a reader wants "NVDA lost $188 today" more than a ratio.
+# It is deliberately NOT persisted: the attribution table has no
+# column for it, and adding one is a migration rather than part of
+# an arithmetic fix.
+# =================================================================
+def open_unrealized_usd(market_value, unrealized_pnl_pct):
+    """PURE. A position's absolute open gain, from the two figures
+    position_pnl_history actually stores.
+
+    If pct = (mv - cost) / cost, then cost = mv / (1 + pct/100) and the
+    open gain is mv - cost. Reconstructed rather than stored because
+    storing it would be a migration; exact given the inputs.
+
+    Returns None when it cannot be derived — including a position down
+    exactly 100%, where cost would divide by zero.
+    """
+    if market_value is None or unrealized_pnl_pct is None:
+        return None
+    mv, pct = float(market_value), float(unrealized_pnl_pct)
+    denom = 1.0 + pct / 100.0
+    if denom == 0:
+        return None
+    return mv - (mv / denom)
+
+
+def compute_contributions(today_rows: list[dict], prior_rows: list[dict],
+                          total_pnl: float,
+                          sessions_since_prior) -> list[dict]:
+    """PURE. Each position's share of today's P&L, or None with a
+    stated reason.
+
+    `today_rows` and `prior_rows` are dicts with ticker, market_value
+    and unrealized_pnl_pct. `sessions_since_prior` is NYSE sessions
+    between the two snapshot dates — 1 is adjacent, anything else is
+    a gap, and None means there is no prior snapshot at all.
+    """
+    prior = {r["ticker"]: r for r in prior_rows}
+    out = []
+
+    for row in sorted(today_rows, key=lambda r: r["ticker"]):
+        ticker = row["ticker"]
+        entry = {"ticker": ticker, "contribution_usd": None,
+                 "contribution_pct": None, "basis": ""}
+
+        if sessions_since_prior is None:
+            entry["basis"] = ("no earlier snapshot on record — first close "
+                              "for this book")
+            out.append(entry)
+            continue
+        if sessions_since_prior != 1:
+            entry["basis"] = (
+                f"previous snapshot is {sessions_since_prior} session(s) back, "
+                f"not one — a multi-session change over a one-day P&L figure "
+                f"would be meaningless, so it is not reported")
+            out.append(entry)
+            continue
+        if ticker not in prior:
+            entry["basis"] = ("no prior snapshot for this position — opened "
+                              "since the last close")
+            out.append(entry)
+            continue
+
+        now_abs = open_unrealized_usd(row.get("market_value"),
+                                      row.get("unrealized_pnl_pct"))
+        was_abs = open_unrealized_usd(prior[ticker].get("market_value"),
+                                      prior[ticker].get("unrealized_pnl_pct"))
+        if now_abs is None or was_abs is None:
+            entry["basis"] = "market value or P&L percentage missing on one of the two snapshots"
+            out.append(entry)
+            continue
+
+        change = now_abs - was_abs
+        entry["contribution_usd"] = round(change, 2)
+        if not total_pnl:
+            entry["basis"] = ("today's total P&L is zero — a share of zero is "
+                              "undefined, so only the dollar change is given")
+        else:
+            entry["contribution_pct"] = round(change / total_pnl * 100, 2)
+            entry["basis"] = "change since the previous session, over today's total P&L"
+        out.append(entry)
+
+    return out
+
+
 def compute_attribution(session, today: date) -> list[dict]:
-    positions = session.query(Position).all()
+    """DATABASE. Reads the two snapshots and the day's P&L, then defers
+    to the pure function above for every judgement."""
     pnl_row = session.query(DailyPnl).filter(DailyPnl.pnl_date == today).first()
     total_pnl = float(pnl_row.total_pnl) if pnl_row and pnl_row.total_pnl else 0.0
 
-    attribution = []
-    for p in positions:
-        contribution_pct = round(float(p.unrealized_pnl or 0) / total_pnl * 100, 2) if total_pnl else 0.0
+    prior_date = (
+        session.query(func.max(PositionPnlHistory.snapshot_date))
+        .filter(PositionPnlHistory.snapshot_date < today)
+        .scalar()
+    )
+    sessions_since_prior = (trading_days_between(prior_date, today)
+                            if prior_date else None)
+
+    def snaps(on_date):
+        if on_date is None:
+            return []
+        return [{"ticker": r.ticker, "market_value": r.market_value,
+                 "unrealized_pnl_pct": r.unrealized_pnl_pct}
+                for r in session.query(PositionPnlHistory)
+                .filter(PositionPnlHistory.snapshot_date == on_date).all()]
+
+    contributions = compute_contributions(
+        snaps(today), snaps(prior_date), total_pnl, sessions_since_prior)
+
+    # Thesis status is a separate question from arithmetic, and the
+    # "no thesis on record" case is a compliance finding rather than a
+    # missing number — it is what surfaced NVDA on 2026-09-17.
+    for entry in contributions:
         monitoring = (
             session.query(PositionMonitoringLog)
-            .filter(PositionMonitoringLog.ticker == p.ticker)
+            .filter(PositionMonitoringLog.ticker == entry["ticker"])
             .order_by(PositionMonitoringLog.log_date.desc())
             .first()
         )
-        thesis_status = monitoring.status if monitoring else "no thesis on record"
-        attribution.append({"ticker": p.ticker, "contribution_pct": contribution_pct, "thesis_status": thesis_status})
-    return attribution
+        entry["thesis_status"] = monitoring.status if monitoring else "no thesis on record"
+    return contributions
 
 
 def run(today: date) -> dict:
