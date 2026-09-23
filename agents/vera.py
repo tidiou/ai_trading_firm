@@ -32,6 +32,7 @@ prompts additionally forbid "buy"/"sell" language as a second,
 belt-and-suspenders layer on top of that hard capability limit.
 """
 
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Literal, Optional
 
@@ -745,6 +746,98 @@ def get_open_theses(session) -> list[Thesis]:
     return session.query(Thesis).filter(Thesis.closed_date.is_(None)).all()
 
 
+def get_position_tickers(session) -> list[str]:
+    """What the book actually holds, per Otis's positions table.
+
+    Otis rebuilds that table from Alpaca at every close, so it is the
+    one record here with an external authority behind it. A thesis is
+    something this desk wrote down; a position is something the broker
+    confirms. Where the two disagree, the broker is right about what is
+    owned and the thesis is right about nothing at all.
+    """
+    return sorted({p.ticker for p in session.query(Position).all()})
+
+
+# =================================================================
+# BOOK RECONCILIATION — positions against open theses.
+#
+# THE DEFECT THIS EXISTS TO PREVENT. Until today the monitoring pass
+# took its list of "held" names from the OPEN THESES table, and the
+# screening pass excluded that same list from the universe. Nothing
+# ever compared it to what the broker said was owned. On 2026-09-23
+# the book held AAPL and NVDA while Vera monitored AAPL and GOOGL:
+#
+#   GOOGL  a thesis Marcus opened at ALLOCATION on 17 Sept. Ada then
+#          refused the order on a stale ledger, so the order never
+#          filled — and the thesis outlived it. Vera checked its
+#          assumptions daily against a position that did not exist,
+#          and Clara published "AAPL and GOOGL holdings are intact".
+#   NVDA   84% of the invested book, monitored by nobody, because the
+#          orphan-adoption pass that documents it ran AFTER the
+#          monitoring pass had already chosen its list.
+#
+# WHY IT SURVIVED SIX DAYS. Both counts were 2. Nora reported "2
+# positions" from the positions table and Vera reported "2 positions
+# monitored" from the theses table, the numbers agreed, and nothing
+# printed the names side by side. A mismatch that is only visible in
+# the names is invisible in a count, so this names them.
+#
+# THE TWO DIFFERENCES ARE NAMED SEPARATELY AND SYMMETRICALLY,
+# because they are opposite failures with opposite remedies:
+#
+#   positions − theses = ORPHAN     held, undocumented. Already
+#                                   handled: review_orphan_positions
+#                                   adopts or recommends exit.
+#   theses − positions = PHANTOM    documented, not held. NOT handled,
+#                                   deliberately — see run().
+# =================================================================
+@dataclass
+class BookReconciliation:
+    positions: list[str]     # what the broker says is owned
+    theses: list[str]        # what has an open thesis on record
+    monitored: list[str]     # both — a position whose claims get checked
+    orphans: list[str]       # held with no thesis
+    phantoms: list[str]      # a thesis with no position
+
+    @property
+    def is_reconciled(self) -> bool:
+        return not self.orphans and not self.phantoms
+
+    def describe(self) -> str:
+        """One line, always naming tickers rather than counting them.
+        This is the string the 17–23 Sept inversion would have failed
+        loudly against on day one."""
+        if self.is_reconciled:
+            names = ", ".join(self.monitored) or "none"
+            return (f"Book reconciled — {len(self.monitored)} position(s) "
+                    f"monitored: {names}.")
+        parts = [f"{len(self.monitored)} monitored "
+                 f"({', '.join(self.monitored) or 'none'})"]
+        if self.orphans:
+            parts.append("orphan position(s) with no thesis: "
+                         + ", ".join(self.orphans))
+        if self.phantoms:
+            parts.append("phantom thesis(es) with no position: "
+                         + ", ".join(self.phantoms))
+        return "Book NOT reconciled — " + "; ".join(parts) + "."
+
+
+def reconcile_book(position_tickers, thesis_tickers) -> BookReconciliation:
+    """Pure set arithmetic over two ticker lists. Takes tickers rather
+    than a session so the invariant can be tested without a database —
+    which is the whole reason it is a function and not four lines
+    inlined in run()."""
+    held = {t for t in position_tickers}
+    documented = {t for t in thesis_tickers}
+    return BookReconciliation(
+        positions=sorted(held),
+        theses=sorted(documented),
+        monitored=sorted(held & documented),
+        orphans=sorted(held - documented),
+        phantoms=sorted(documented - held),
+    )
+
+
 # =================================================================
 # JOB 3 (added later): orphan position review. Closes a real gap
 # found when a test trade (AAPL) entered the book without ever going
@@ -796,10 +889,15 @@ as its very first character and contain nothing else:
 def get_orphan_positions(session) -> list[str]:
     """Tickers currently held (per Otis's positions table) with no
     open Thesis on record — the gap that let AAPL go completely
-    unexamined by the research/approval pipeline."""
-    held = {p.ticker for p in session.query(Position).all()}
-    documented = {t.ticker for t in session.query(Thesis).filter(Thesis.closed_date.is_(None)).all()}
-    return sorted(held - documented)
+    unexamined by the research/approval pipeline.
+
+    Now one half of reconcile_book(), so the two directions of
+    disagreement cannot drift apart. This function was already reading
+    the right table; the monitoring pass simply never used it."""
+    return reconcile_book(
+        get_position_tickers(session),
+        [t.ticker for t in get_open_theses(session)],
+    ).orphans
 
 
 def review_orphan_positions(today: date) -> list[dict]:
@@ -857,21 +955,74 @@ def run(today: date, atlas_output: dict) -> dict:
     verdicts: dict = {}
     assumptions_by_thesis: dict = {}
 
+    # -------------------------------------------------------------
+    # JOB 3 RUNS FIRST — it used to run last, and that ordering cost
+    # NVDA a day of monitoring. Adoption writes a Thesis row; reading
+    # the theses afterwards means a name adopted this morning is
+    # monitored this morning instead of tomorrow.
+    #
+    # Wrapped, because the move changed what a failure here costs.
+    # Last it was the final step and a failure lost only itself; first,
+    # an unguarded failure would take the whole monitoring and
+    # screening pass with it. This is the same trade author_assumptions
+    # makes a few lines below and for the same reason: the orphan pass
+    # is documentation, and no documentation gap is worth a day of
+    # monitoring. The error is returned rather than only logged, so a
+    # silent skip cannot look like "no orphans".
+    # -------------------------------------------------------------
+    orphan_reviews: list[dict] = []
+    orphan_review_error: Optional[str] = None
+    try:
+        orphan_reviews = review_orphan_positions(today)
+    except Exception as exc:  # noqa: BLE001
+        orphan_review_error = f"{type(exc).__name__}: {exc}"
+        logger.warning("Orphan review failed (%s). Any undocumented "
+                       "position stays undocumented today and will be "
+                       "reported as an orphan below.", orphan_review_error)
+
     with session_scope() as session:
         open_theses = get_open_theses(session)
-        held_tickers = [t.ticker for t in open_theses]
+        book = reconcile_book(get_position_tickers(session),
+                              [t.ticker for t in open_theses])
+
+    # THE MONITORED SET IS positions ∩ open theses. A position with a
+    # thesis is the only thing whose assumptions can be checked: a
+    # phantom has no price action to check them against, and an orphan
+    # has no claims to check.
+    monitored = set(book.monitored)
+    monitored_theses = [t for t in open_theses if t.ticker in monitored]
+
+    # THE INVARIANT NOBODY WAS CHECKING. After the orphan pass above,
+    # a clean book reconciles exactly; anything left is a real
+    # disagreement and is logged at WARNING with names, not counts.
+    # An orphan surviving this line means Vera reviewed it and said
+    # exit, or the review failed.
+    if book.is_reconciled:
+        logger.info("Vera — %s", book.describe())
+    else:
+        logger.warning("Vera — %s", book.describe())
+
+    # The broker is the authority on what is held, so this is what
+    # "held" means everywhere below it.
+    held_tickers = book.positions
+    # Screening skips both: a name already owned, and a name that
+    # already has an open thesis. The second is not a claim that a
+    # phantom is held — it is refusing to propose a second thesis for
+    # a name that already has one open. The phantom itself is
+    # surfaced, loudly, above and in the return dict.
+    excluded_from_screening = sorted(set(book.positions) | set(book.theses))
 
     # -------------------------------------------------------------
     # JOB 1: MONITORING — [4] first agentic loop
     # -------------------------------------------------------------
-    if open_theses:
+    if monitored_theses:
         # ---------------------------------------------------------
         # Any open thesis with no claims on record gets them now.
         # One-time per thesis, and the mechanism that retro-fits the
         # theses adopted as orphans before migration 011 — until they
         # have claims they report no verdict at all.
         # ---------------------------------------------------------
-        for t in open_theses:
+        for t in monitored_theses:
             with session_scope() as session:
                 has_claims = bool(open_assumptions(session, t.id))
             if not has_claims:
@@ -890,18 +1041,18 @@ def run(today: date, atlas_output: dict) -> dict:
         with session_scope() as session:
             policy = get_active_risk_policy_for_review(session, today)
             positions_by_ticker = {p.ticker: p for p in session.query(Position).all()}
-            trailing_history = _get_trailing_pnl_history(session, today, [t.ticker for t in open_theses])
+            trailing_history = _get_trailing_pnl_history(session, today, [t.ticker for t in monitored_theses])
             # Read here and used after the scope closes, which is safe
             # because SessionLocal is built with expire_on_commit=False
             # — the column values stay loaded on the instances. Anyone
             # changing that setting in core/db.py breaks this.
-            assumptions_by_thesis = {t.id: open_assumptions(session, t.id) for t in open_theses}
+            assumptions_by_thesis = {t.id: open_assumptions(session, t.id) for t in monitored_theses}
 
         positions_summary = "\n\n".join(
             _format_position_block(t, positions_by_ticker.get(t.ticker), trailing_history.get(t.ticker, []), policy)
             + "\n  Assumptions this thesis rests on:\n"
             + _format_assumptions(assumptions_by_thesis.get(t.id, []))
-            for t in open_theses
+            for t in monitored_theses
         )
 
         monitoring_prompt = (
@@ -928,7 +1079,8 @@ def run(today: date, atlas_output: dict) -> dict:
     # -------------------------------------------------------------
     # JOB 2: SCREENING — [4] second agentic loop
     # -------------------------------------------------------------
-    screening_universe = [t for t in FIXED_UNIVERSE if t not in held_tickers]
+    screening_universe = [t for t in FIXED_UNIVERSE
+                          if t not in excluded_from_screening]
     screening_prompt = (
         f"Today's date: {today}.\n"
         f"Macro backdrop from Atlas: regime={atlas_output.get('regime_signal')}, "
@@ -982,7 +1134,7 @@ def run(today: date, atlas_output: dict) -> dict:
     # duplicate or crash on the unique constraints below.
     # -------------------------------------------------------------
     with session_scope() as session:
-        thesis_by_ticker = {t.ticker: t.id for t in open_theses}
+        thesis_by_ticker = {t.ticker: t.id for t in monitored_theses}
         for m in monitoring_results:
             thesis_id = thesis_by_ticker[m.ticker]
             stored = assumptions_by_thesis.get(thesis_id, [])
@@ -1104,7 +1256,9 @@ def run(today: date, atlas_output: dict) -> dict:
                 .update({"sector": sector}, synchronize_session=False)
             )
 
-    orphan_reviews = review_orphan_positions(today)
+    # (The orphan review used to run here. It now runs at the top of
+    # run(), so that a name adopted this morning is monitored this
+    # morning.)
 
     # D7 — how much of what she asked for she actually got. Carried in
     # her output rather than logged, because the agent that has to act
@@ -1122,6 +1276,30 @@ def run(today: date, atlas_output: dict) -> dict:
         "monitoring": [m.model_dump() for m in monitoring_results],
         "candidates": [c.model_dump() for c in candidate_results],
         "orphan_reviews": orphan_reviews,
+        # Non-None means the orphan pass threw and was contained. An
+        # empty orphan_reviews list with this set is NOT "no orphans".
+        "orphan_review_error": orphan_review_error,
+        # What the broker holds, what has a thesis, and the two ways
+        # they disagree — named, not counted. `phantoms` is the field
+        # that would have caught the GOOGL inversion on 17 Sept.
+        #
+        # A PHANTOM IS NOT AUTO-CLOSED, deliberately. Closing it here
+        # would resolve GOOGL silently and discard real research on a
+        # guess about why the position is missing — the order never
+        # filled, it was sold outside the desk, or Otis's sync is
+        # behind. Those want three different answers. This module's
+        # instinct everywhere else is to refuse and surface rather
+        # than guess, and a phantom thesis is a decision for a human,
+        # not a cleanup for the desk.
+        "book": {
+            "positions": book.positions,
+            "theses": book.theses,
+            "monitored": book.monitored,
+            "orphans": book.orphans,
+            "phantoms": book.phantoms,
+            "reconciled": book.is_reconciled,
+            "statement": book.describe(),
+        },
         "data_coverage": data_coverage,
         # What the screening pass did, including on the days it did
         # nothing. Rides in the return dict rather than a new table:
