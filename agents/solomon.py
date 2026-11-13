@@ -134,6 +134,20 @@ Hard rules — these are not suggestions:
   adds are refused in code — trims and exits are not, because a broken
   feed is a reason to stop buying and never a reason to stop
   de-risking.
+- A LEDGER FRESHNESS line appears below. The books are normally one
+  close behind, and that is fine. If it says STALE, every P&L figure,
+  weight and loss percentage in Vera's monitoring and in the portfolio
+  shown comes from an older close than the one you would assume. The
+  same frozen figure appearing on several days is ONE observation seen
+  repeatedly — it is not new deterioration each day, and it is not a
+  new trigger. Ada also refuses to size against a stale ledger, so a
+  proposal made on a stale day may not execute; do not escalate on the
+  assumption that it will.
+- Each monitored position now carries a `cause`: market_wide,
+  sector_wide, company_specific or unknown. It is Vera's classification
+  of WHOSE move it was, not a verdict on the thesis. `unknown` means she
+  could not confirm a source — it is an honest answer, not a gap in her
+  work, and it is information you should weigh, not skip past.
 - You will be shown your own escalation history from recent days. If
   you've escalated something every single day recently, treat that
   as a signal to raise your own bar today, not lower it.
@@ -520,6 +534,10 @@ def run(today: date, atlas_output: dict, vera_output: dict) -> dict:
             f"Floor for opening or increasing risk: {MIN_DATA_COVERAGE_PCT}%."
         )
 
+    freshness = vera_output.get("ledger_freshness")
+    freshness_line = (freshness["line"] if isinstance(freshness, dict) and freshness.get("line")
+                      else "not reported by this run of Vera.")
+
     user_prompt = f"""Today's date: {today}
 
 MACRO BACKDROP (from Atlas):
@@ -543,6 +561,9 @@ documented and need no action from you):
 
 DATA COVERAGE (how much of what Vera asked for she actually got):
 {coverage_line}
+
+LEDGER FRESHNESS (how old the portfolio figures above are):
+{freshness_line}
 
 CURRENT PORTFOLIO:
 {portfolio_summary}
@@ -660,6 +681,10 @@ Decide whether anything clears the bar for escalation today."""
         "narrative": output.narrative,
         "rejected_proposals": rejected,
         "data_coverage": data_coverage,
+        # What Solomon was told about the age of the figures he reasoned
+        # from, so a decision made on stale data is recognisable as one
+        # when it is graded.
+        "ledger_freshness": freshness,
         "validation": {
             "proposed": len(proposed),
             "kept": len(kept),

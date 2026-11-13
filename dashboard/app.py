@@ -51,6 +51,7 @@ import streamlit.components.v1 as components
 from core.db import engine
 from core.benchmark import BENCHMARK_TICKER, compute_performance
 from core.cycle_schedule import GROUP_ORDER, PHASE_GROUPS, cycle_row_name, is_cycle_row
+from core.run_outcome import classify_group_row
 from core.market_calendar import EASTERN, NYSE, is_trading_day, market_is_open_now
 
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -975,8 +976,17 @@ class Desk:
     """Every figure the Floor and the dossiers show, loaded once."""
 
     def __init__(self):
+        # `error_message` and, for the group rows only, the summary in
+        # `raw_output`: a group's status says `completed` whether it did
+        # its job or merely reached the end, and the difference lives in
+        # those two. Restricted to the cycle rows so the agents' own
+        # payloads (Vera's alone can run to tens of kilobytes) are not
+        # pulled into the page for nothing. `left(...)` rather than LIKE
+        # because the query already carries a `%s` parameter.
         all_runs_today = load(
-            "SELECT agent_name, phase, status, started_at, completed_at "
+            "SELECT agent_name, phase, status, started_at, completed_at, "
+            "error_message, "
+            "CASE WHEN left(agent_name, 6) = 'cycle:' THEN raw_output END AS raw_output "
             "FROM agent_runs WHERE run_date = %s", (et_today,))
         # The cycle rows (`cycle:premarket` and friends) share this
         # table with the agents but are not agents — they record that a
@@ -1114,23 +1124,42 @@ class Desk:
         for key in GROUP_ORDER:
             spec = PHASE_GROUPS[key]
             state = "not_run"
+            raw, err = None, None
             if trading and not self.cycle_runs.empty:
                 row = self.cycle_runs[
                     self.cycle_runs["agent_name"] == cycle_row_name(key)]
                 if not row.empty:
                     state = str(row.iloc[0]["status"])
+                    # `.get` and isinstance, because the frame may lack
+                    # the columns (an older query) and a missing value
+                    # arrives as NaN, not None.
+                    raw = row.iloc[0].get("raw_output")
+                    err = row.iloc[0].get("error_message")
+            # What the group ACTUALLY did. `completed` covers a group
+            # that did its work, one that stood down, and one that
+            # finished without doing its job — see core.run_outcome.
+            outcome = classify_group_row(
+                None if state == "not_run" else state,
+                raw if isinstance(raw, dict) else None,
+                err if isinstance(err, str) else None)
             out.append({
                 "key": key,
                 "label": spec.label,
                 "phases": spec.phases,
                 "state": "n/a" if not trading else state,
                 "due_by": spec.due_by.strftime("%H:%M"),
+                "outcome": outcome.label,
+                "kind": outcome.kind,
+                "detail": outcome.detail,
+                "attention": outcome.needs_attention,
                 # `running` counts as overdue once its hour is long past:
                 # a group stuck in `running` never wrote a completion, and
                 # a process that died mid-flight leaves exactly that row.
-                "overdue": bool(trading
-                                and state in ("not_run", "failed", "running")
-                                and now_t > spec.due_by),
+                # A group that completed WITHOUT doing its job is as late
+                # as one that never started once its hour has passed.
+                "overdue": bool(trading and now_t > spec.due_by and (
+                    state in ("not_run", "failed", "running")
+                    or (state == "completed" and outcome.needs_attention))),
             })
         return out
 
@@ -1338,8 +1367,13 @@ def schedule_strip(desk: Desk) -> str:
 
     chips = ""
     for r in rows:
+        problem = r["state"] == "completed" and r.get("attention")
         if r["overdue"]:
             col, mark = C["oxblood"], "&#9679;"
+        elif problem:
+            # Completed, but not clean: ran with errors, or refused. Amber
+            # rather than the green tick `completed` used to earn.
+            col, mark = C["amber"], "&#9888;"
         elif r["state"] == "completed":
             col, mark = C["green"], "&#10003;"
         elif r["state"] == "running":
@@ -1348,18 +1382,27 @@ def schedule_strip(desk: Desk) -> str:
             col, mark = C["oxblood"], "&#10007;"
         else:
             col, mark = C["faint"], "&#9675;"   # not run, not yet due
+        shown = r.get("outcome") or r["state"]
         chips += (f'<span class="mby-sched-chip" style="color:{col}">'
                   f'{mark} {esc(r["key"])}'
-                  f'<i>{esc(r["state"].replace("_", " "))}</i></span>')
+                  f'<i>{esc(str(shown).replace("_", " "))}</i></span>')
 
-    late = [r for r in rows if r["overdue"]]
-    if late:
-        names = ", ".join(r["key"] for r in late)
+    # Two different kinds of late, with two different next steps: a run
+    # that never happened (look at the scheduler), and a run that
+    # happened and did not do its job (look at what it says went wrong).
+    never = [r for r in rows if r["overdue"] and not (r["state"] == "completed" and r.get("attention"))]
+    broken = [r for r in rows if r["overdue"] and r["state"] == "completed" and r.get("attention")]
+    if never or broken:
+        parts = []
+        if never:
+            parts.append(f'{esc(", ".join(r["key"] for r in never))} did not run — check '
+                         f'<span class="mby-mono">logs/</span> and '
+                         f'<span class="mby-mono">launchctl list | grep com.mby</span>')
+        for r in broken:
+            parts.append(f'{esc(r["key"])} ran but did not do its job'
+                         + (f' — {esc(r["detail"])}' if r.get("detail") else ""))
         note = (f'<span class="mby-sched-note" style="color:{C["oxblood"]}">'
-                f'{esc(names)} did not run — check '
-                f'<span class="mby-mono">logs/</span> and '
-                f'<span class="mby-mono">launchctl list | grep com.mby</span>'
-                f'</span>')
+                + "; ".join(parts) + '</span>')
     else:
         note = (f'<span class="mby-sched-note" style="color:{C["faint"]}">'
                 f'scheduled runs, Eastern</span>')

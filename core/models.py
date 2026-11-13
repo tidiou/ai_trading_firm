@@ -151,6 +151,9 @@ class PositionMonitoringLog(Base):
     # a thesis that was in trouble and got better.
     verdict: Mapped[Optional[str]]
     assumption_checks: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # WHY the position moved — migration 015, vocabulary in core/cause.py.
+    # None on rows that predate the question; never backfilled.
+    cause: Mapped[Optional[str]]
 
 
 class ThesisAssumption(Base):

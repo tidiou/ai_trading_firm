@@ -173,6 +173,37 @@ def get_run_status(run_date, agent_name: str) -> Optional[str]:
         return row.status if row else None
 
 
+def get_run_record(run_date, agent_name: str) -> Optional[dict]:
+    """
+    The whole row — status, output summary and error — or None if the
+    agent has not run.
+
+    EXISTS FOR `core.run_outcome`. `get_run_status` returns the status
+    column alone, and the status column cannot tell a group that did its
+    work from one that finished without doing its job (see that module).
+    The outcome has to be derived from the summary and the error as
+    well, so this reads all three in one query.
+
+    A display helper, not a decision input: nothing that makes a trading
+    decision should read this. It returns a truncated payload as-is,
+    flagged, and leaves the reader to decide what a preview is worth.
+    """
+    with session_scope() as session:
+        row = (
+            session.query(AgentRun)
+            .filter(AgentRun.run_date == run_date, AgentRun.agent_name == agent_name)
+            .first()
+        )
+        if row is None:
+            return None
+        output = row.raw_output
+        return {
+            "status": row.status,
+            "output": output if isinstance(output, dict) else None,
+            "error": row.error_message,
+        }
+
+
 def load_agent_output(run_date, agent_name: str,
                       require_completed: bool = True) -> Optional[dict]:
     """

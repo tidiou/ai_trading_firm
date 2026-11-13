@@ -45,6 +45,8 @@ import logging
 from core.clients import fmp_client
 from core.clients.claude_client import run_agent_loop, extract_json
 from core.db import session_scope
+from core.cause import trigger_cause_mismatch
+from core.freshness import freshness_stamp
 from core.models import (Thesis, PositionMonitoringLog, NewCandidate, Position,
                          RiskPolicyVersion, PositionPnlHistory, ThesisAssumption)
 from core.theme import THEME_LINKS, THEME_UNIVERSE
@@ -391,6 +393,12 @@ class PositionMonitoring(BaseModel):
     trigger: Literal["none", "earnings", "news", "fundamental_drift", "macro_conflict", "profit_target_sustained"]
     reasoning: str
     conviction_score: int  # 1-5, compared against the thesis's original score
+    # WHY the position moved, as distinct from WHAT triggered the status.
+    # Defaults to "unknown" so an older prompt or a model that omits it
+    # still validates — an absent answer is "I could not tell", and
+    # failing a whole monitoring pass over a missing label would be a
+    # worse trade than the label. Vocabulary: core/cause.py.
+    cause: Literal["market_wide", "sector_wide", "company_specific", "unknown"] = "unknown"
     # One entry per open assumption on this thesis. Empty for a thesis
     # that has none yet — which yields NO verdict rather than a
     # flattering default.
@@ -507,6 +515,46 @@ properly, using your tools, before concluding anything:
   consideration if the trend genuinely looks sustained, and say so
   explicitly in your reasoning either way.
 
+WHY IT MOVED — the `cause` field, required for every position. A move
+has a cause before it has a meaning, and the question that decides
+whether a decline is a correction or a broken thesis is WHOSE move it
+was. Classify it as exactly one of:
+
+    market_wide       the broad index moved the same way by a
+                      comparable amount (allow for this name's beta)
+    sector_wide       the same link of the chain moved together while
+                      the index did not — check two or three peers with
+                      your quote tool
+    company_specific  ONLY if a tool result names a specific event for
+                      THIS company: a filing, a reported result, a
+                      guidance change, a dated news item. Cite it in
+                      `reasoning`. A price move alone is never evidence
+                      of a company-specific cause — it is the thing
+                      being explained.
+    unknown           you could not confirm any of the above. THIS IS
+                      THE DEFAULT, and it is a complete, honest answer.
+
+You will often have no source that names a company event. Then the
+answer is `unknown` — not `company_specific`, and not a trigger that
+implies one. `unknown` does not justify `at_risk` or `broken` by
+itself; it is a reason to keep investigating tomorrow. The triggers
+`fundamental_drift`, `earnings` and `news` assert something about the
+company's own state, so they REQUIRE `cause` to be `company_specific`
+and an item you can name. Without that, use `macro_conflict` (a
+divergence you can see but cannot explain) or `none`.
+
+DATA FRESHNESS. A freshness line tells you how old the portfolio
+figures are. The books are normally one close behind, and that is fine.
+If the line says STALE, every P&L percentage you were shown comes from
+that older close:
+- do not describe a figure as "today's" or "unchanged since yesterday";
+- a loss that crossed the threshold on stale data is still a reason to
+  investigate, but a figure that has not moved because it is stale is
+  NOT evidence that nothing has changed — the position has moved on and
+  the numbers have not;
+- say in your reasoning that the figures are stale, and do not treat the
+  same frozen figure repeated across sessions as new deterioration.
+
 Other rules:
 - Never suggest a new idea here — that is a separate pass with a
   separate mandate. Stay focused on the positions given to you.
@@ -553,6 +601,7 @@ result, matching exactly this shape:
     "ticker": "...",
     "status": "intact | at_risk | broken",
     "trigger": "none | earnings | news | fundamental_drift | macro_conflict | profit_target_sustained",
+    "cause": "market_wide | sector_wide | company_specific | unknown",
     "reasoning": "1-3 sentences — explain WHY, referencing the market comparison or trend data you were given",
     "assumption_checks": [
       {"claim": "exact wording of the claim as shown to you",
@@ -1341,6 +1390,21 @@ def run(today: date, atlas_output: dict) -> dict:
     # surfaced, loudly, above and in the return dict.
     excluded_from_screening = sorted(set(book.positions) | set(book.theses))
 
+    # How old the portfolio figures she is about to reason from are. The
+    # monitoring prompt shows this, and it is carried in her output so
+    # Solomon sees it and the run ledger records it. Contained: failing
+    # to read the ledger's age must not cost the day's monitoring, and an
+    # unreadable age is reported as unreadable, not as fresh.
+    try:
+        from core.ledger import read_snapshot
+        ledger_freshness = read_snapshot(today).freshness()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read the ledger's age (%s); the monitoring "
+                       "prompt will say so.", exc)
+        ledger_freshness = freshness_stamp(None, None, unreadable=True)
+    if ledger_freshness.get("stale"):
+        logger.warning("Vera — the ledger is STALE: %s", ledger_freshness["line"])
+
     # -------------------------------------------------------------
     # JOB 1: MONITORING — [4] first agentic loop
     # -------------------------------------------------------------
@@ -1387,7 +1451,8 @@ def run(today: date, atlas_output: dict) -> dict:
         monitoring_prompt = (
             f"Today's date: {today}\n"
             f"Macro backdrop (Atlas): regime={atlas_output.get('regime_signal')}, "
-            f"confidence={atlas_output.get('confidence')}, narrative: {atlas_output.get('narrative')}\n\n"
+            f"confidence={atlas_output.get('confidence')}, narrative: {atlas_output.get('narrative')}\n"
+            f"Portfolio data freshness: {ledger_freshness['line']}\n\n"
             f"Positions to review:\n{positions_summary}"
         )
 
@@ -1404,6 +1469,19 @@ def run(today: date, atlas_output: dict) -> dict:
         ]
     else:
         monitoring_results = []  # nothing held yet — a valid, expected state on day one
+
+    # A trigger and a cause that contradict each other — `fundamental_drift`
+    # on a move she classed as market-wide, say. AUDIT, NOT OVERRIDE: the
+    # status she assigned stands and her output is not rejected, but the
+    # contradiction is named, logged and carried in her output so it is
+    # visible to whoever grades her. See core/cause.py.
+    cause_flags: list[dict] = []
+    for m in monitoring_results:
+        why = trigger_cause_mismatch(m.trigger, m.cause)
+        if why:
+            cause_flags.append({"ticker": m.ticker, "issue": why})
+            logger.warning("Vera — %s: %s. Status unchanged; recorded, not corrected.",
+                           m.ticker, why)
 
     # -------------------------------------------------------------
     # JOB 2: SCREENING — [4] second agentic loop
@@ -1511,6 +1589,7 @@ def run(today: date, atlas_output: dict) -> dict:
                 conviction_score=m.conviction_score,
                 verdict=v.verdict,
                 assumption_checks=checks_json,
+                cause=m.cause,
             )
             stmt = stmt.on_conflict_do_update(
                 index_elements=["log_date", "thesis_id"],
@@ -1521,6 +1600,7 @@ def run(today: date, atlas_output: dict) -> dict:
                     "conviction_score": stmt.excluded.conviction_score,
                     "verdict": stmt.excluded.verdict,
                     "assumption_checks": stmt.excluded.assumption_checks,
+                    "cause": stmt.excluded.cause,
                 },
             )
             session.execute(stmt)
@@ -1664,6 +1744,12 @@ def run(today: date, atlas_output: dict) -> dict:
         # What today did to each open thesis, computed from the
         # per-claim checks rather than asked of the model.
         "verdicts": verdicts,
+        # Trigger/cause pairs that contradict each other, by ticker. Empty
+        # on a day where every label holds together.
+        "cause_flags": cause_flags,
+        # How old the portfolio figures she reasoned from were. Carried
+        # here because the agent that has to weigh it next is Solomon.
+        "ledger_freshness": ledger_freshness,
         # Claims written for a thesis that had none — one-time per
         # thesis, so this is empty on almost every day.
         "authored_assumptions": authored_assumptions,

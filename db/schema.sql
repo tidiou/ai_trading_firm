@@ -154,6 +154,13 @@ CREATE TABLE IF NOT EXISTS position_monitoring_log (
     -- from this, so a stored verdict can always be re-checked against
     -- its own inputs.
     assumption_checks JSONB,
+    -- WHY the position moved (migration 015): market_wide | sector_wide |
+    -- company_specific | unknown. NULL on rows that predate the question
+    -- — deliberately not 'unknown', which would claim the question was
+    -- asked and not answered. Vocabulary in core/cause.py.
+    cause             TEXT CONSTRAINT position_monitoring_log_cause_check
+                      CHECK (cause IN ('market_wide', 'sector_wide',
+                                       'company_specific', 'unknown')),
     UNIQUE (log_date, thesis_id)
 );
 

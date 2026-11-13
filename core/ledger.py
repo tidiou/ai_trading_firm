@@ -38,6 +38,7 @@ from datetime import date
 from typing import Optional
 
 from core.db import session_scope
+from core.freshness import STALE_AFTER_SESSIONS, freshness_stamp
 from core.market_calendar import trading_days_between
 from core.models import DailyPnl, Position
 
@@ -49,7 +50,10 @@ from core.models import DailyPnl, Position
 # percentage of a stale NAV produces a confidently wrong number, which
 # is worse than refusing, so past this the ledger reports itself
 # unusable and Ada declines to trade rather than guessing.
-MAX_LEDGER_STALENESS_SESSIONS = 1
+#
+# Defined in core.freshness, so what Ada refuses to size against is
+# exactly what Vera and Solomon are told to distrust.
+MAX_LEDGER_STALENESS_SESSIONS = STALE_AFTER_SESSIONS
 
 
 @dataclass(frozen=True)
@@ -89,6 +93,12 @@ class LedgerSnapshot:
             f"({self.staleness_sessions} session(s) old), NAV {self.nav:,.2f}, "
             f"{len(self.positions)} position(s)"
         )
+
+    def freshness(self) -> dict:
+        """The ledger's age as one reading — see core.freshness. What the
+        LLM agents are shown, so a stale figure cannot read as a stable one."""
+        return freshness_stamp(self.as_of, self.staleness_sessions,
+                               bootstrap=self.bootstrap)
 
     def position_value(self, ticker: str) -> float:
         """Market value of a holding at the last close, 0.0 if not held."""

@@ -235,6 +235,18 @@ _bench = _ilu.module_from_spec(_bspec)
 _bspec.loader.exec_module(_bench)
 sys.modules["core.benchmark"] = _bench
 
+# core.run_outcome is stdlib-only for the same reason core.cycle_schedule
+# is, so the real module is used: a stubbed classifier would happily
+# agree with a broken one.
+_ospec = _ilu.spec_from_file_location(
+    "core.run_outcome",
+    str(next(c for c in (_here / "run_outcome.py",
+                         _here.parent / "core" / "run_outcome.py",
+                         _here / "core" / "run_outcome.py") if c.exists())))
+_run_outcome = _ilu.module_from_spec(_ospec)
+_ospec.loader.exec_module(_run_outcome)
+sys.modules["core.run_outcome"] = _run_outcome
+
 # ---------------- canned rows ----------------
 POP = {
     "trading_control": [{"trading_enabled": True, "changed_by": "malick",
@@ -270,6 +282,23 @@ POP = {
         {"agent_name": "nora_monitor", "phase": 5, "status": "failed", "run_date": TODAY,
          "started_at": pd.Timestamp("2026-09-04 20:11"), "completed_at": None,
          "error_message": "boom"},
+        # The group rows. One of each kind the schedule strip must now
+        # tell apart: clean, stood down, and finished WITHOUT doing its
+        # job (the 22 Oct close — `completed`, with Otis's error inside).
+        {"agent_name": "cycle:premarket", "phase": 0, "status": "completed", "run_date": TODAY,
+         "started_at": pd.Timestamp("2026-09-04 13:00"), "completed_at": pd.Timestamp("2026-09-04 13:10"),
+         "error_message": None,
+         "raw_output": {"group": "premarket", "attempt": 1, "skipped": None, "errors": {}}},
+        {"agent_name": "cycle:execution", "phase": 0, "status": "completed", "run_date": TODAY,
+         "started_at": pd.Timestamp("2026-09-04 15:45"), "completed_at": pd.Timestamp("2026-09-04 15:46"),
+         "error_message": None,
+         "raw_output": {"group": "execution", "attempt": 1,
+                        "skipped": "solomon: no action needed", "errors": {}}},
+        {"agent_name": "cycle:close", "phase": 0, "status": "completed", "run_date": TODAY,
+         "started_at": pd.Timestamp("2026-09-04 22:15"), "completed_at": pd.Timestamp("2026-09-04 22:20"),
+         "error_message": "otis: ConnectionError: apikey=SHOULD-NEVER-BE-RENDERED",
+         "raw_output": {"group": "close", "attempt": 1, "skipped": None,
+                        "errors": {"otis": "ConnectionError: Max retries exceeded"}}},
     ],
     "macro_briefs": [{"regime_signal": "transitioning", "change_from_yesterday": "narrower",
                       "brief_date": TODAY, "confidence": "medium", "narrative": "n"}],
@@ -398,6 +427,19 @@ if VIEW == "floor":
         strip = "schedule strip"
         if "did not run" in floor:
             strip += " + overdue banner"
+        # Honest statuses. The populated fixture's close group is
+        # `completed` WITH an error inside (the 22 Oct case) and its
+        # execution group stood down. The strip must say so rather than
+        # print the one word `completed` for both — and must never put
+        # a key that appears in stored error text on the page.
+        if MODE == "populated":
+            assert "WITH ERRORS" in floor, \
+                "a close that completed with errors is shown as a clean completion"
+            assert "no action needed" in floor, \
+                "a group that stood down is not labelled as having stood down"
+            assert "SHOULD-NEVER-BE-RENDERED" not in floor, \
+                "stored error text reached the page unredacted"
+            strip += " + outcomes"
     else:
         assert "mby-sched" not in floor, \
             "schedule strip shown on a non-session day"

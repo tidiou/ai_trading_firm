@@ -112,6 +112,7 @@ def get_or_run_vera(today: date, atlas_output: dict) -> dict:
                         "trigger": m.trigger,
                         "reasoning": m.reasoning,
                         "conviction_score": m.conviction_score,
+                        "cause": getattr(m, "cause", None),
                     }
                     for m in monitoring_rows
                 ],

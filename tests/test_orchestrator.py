@@ -599,3 +599,159 @@ class TestRetryCounter:
             "close", 1, True)
         assert "otis" in summary["errors"]
         assert summary["agents_completed"] == ["clara"]
+
+
+# ===============================================================
+# 8. `completed` is not the same as "did its job"
+# ===============================================================
+class TestAutoRetriesWhatDidNotDoItsJob:
+    """
+    THE 22 OCT 2026 CLOSE. Otis lost a DNS lookup, the close group
+    swallowed it so Clara could still run (correct), and recorded the run
+    `completed` (which then made `auto` decline to look at it again). The
+    network was back minutes later. The ledger stayed frozen for twenty
+    days, and every order Ada was asked to place in that time was refused
+    for a stale one.
+
+    `completed` still means "reached the end". What `auto` needs to know
+    is whether it also did its job, and for exactly two outcomes the
+    answer is "retry".
+    """
+
+    def _tick(self, orch, monkeypatch, outcome, attempts=1, hh=17, mm=0):
+        from core.run_outcome import GroupOutcome  # noqa: F401  (documentation)
+        ran = []
+        monkeypatch.setattr(orch, "group_state", lambda d, g: "completed")
+        monkeypatch.setattr(orch, "_outcome_or_none", lambda d, g: outcome)
+        monkeypatch.setattr(orch, "_attempts_so_far", lambda d, g: attempts)
+        monkeypatch.setattr(orch, "run_group", lambda g, d: ran.append(g) or {"errors": {}})
+        out = orch.run_auto(datetime(2026, 9, 8, hh, mm, tzinfo=ET))
+        return out, ran
+
+    def test_a_close_that_completed_with_errors_is_run_again(self, orch, monkeypatch):
+        from core.run_outcome import PARTIAL, GroupOutcome
+        out, ran = self._tick(orch, monkeypatch,
+                              GroupOutcome(PARTIAL, "otis: ConnectionError", ("otis",)))
+        assert out["action"] == "ran" and ran == ["close"]
+
+    def test_a_refused_execution_is_run_again(self, orch, monkeypatch):
+        """The morning meeting may have been caught up by hand since."""
+        from core.run_outcome import REFUSED, GroupOutcome
+        out, ran = self._tick(orch, monkeypatch, GroupOutcome(REFUSED, "x"),
+                              hh=11, mm=0)
+        assert out["action"] == "ran" and ran == ["execution"]
+
+    def test_a_clean_group_is_still_never_run_twice(self, orch, monkeypatch):
+        """THE PROPERTY THAT MAKES A 15-MINUTE TICK SAFE must survive."""
+        from core.run_outcome import CLEAN, GroupOutcome
+        out, ran = self._tick(orch, monkeypatch, GroupOutcome(CLEAN))
+        assert out["action"] == "skipped" and out["reason"] == "already completed"
+        assert ran == []
+
+    def test_a_quiet_day_is_never_run_again(self, orch, monkeypatch):
+        """Standing down because there was nothing to do is a complete
+        answer, not an error to be retried every fifteen minutes."""
+        from core.run_outcome import QUIET, GroupOutcome
+        out, ran = self._tick(orch, monkeypatch,
+                              GroupOutcome(QUIET, "solomon: no action needed"),
+                              hh=11, mm=0)
+        assert out["action"] == "skipped" and ran == []
+
+    def test_an_unreadable_outcome_falls_back_to_the_old_behaviour(self, orch, monkeypatch):
+        """If the outcome cannot be read the scheduler must do exactly
+        what it did before this existed — never retry on a guess."""
+        out, ran = self._tick(orch, monkeypatch, None)
+        assert out["action"] == "skipped" and ran == []
+
+    def test_the_retry_is_still_capped(self, orch, monkeypatch):
+        from core.cycle_schedule import MAX_ATTEMPTS_PER_GROUP
+        from core.run_outcome import PARTIAL, GroupOutcome
+        out, ran = self._tick(orch, monkeypatch,
+                              GroupOutcome(PARTIAL, "otis: boom", ("otis",)),
+                              attempts=MAX_ATTEMPTS_PER_GROUP)
+        assert out["action"] == "skipped" and out["reason"] == "attempt limit reached"
+        assert ran == []
+
+    def test_a_failed_group_still_takes_the_old_path(self, orch, monkeypatch):
+        """`failed` was already retried; the outcome read must not make
+        it retry twice or skip the cap."""
+        ran = []
+        monkeypatch.setattr(orch, "group_state", lambda d, g: "failed")
+        monkeypatch.setattr(orch, "_attempts_so_far", lambda d, g: 1)
+        monkeypatch.setattr(orch, "_outcome_or_none",
+                            lambda d, g: (_ for _ in ()).throw(
+                                AssertionError("outcome is only read for completed rows")))
+        monkeypatch.setattr(orch, "run_group", lambda g, d: ran.append(g) or {"errors": {}})
+        out = orch.run_auto(datetime(2026, 9, 8, 9, 45, tzinfo=ET))
+        assert out["action"] == "ran" and ran == ["execution"]
+
+
+class TestAttemptsAreCountedHonestly:
+
+    def test_the_group_row_records_the_adjusted_attempt(self):
+        """Structural, in the style of the neighbouring tests: the
+        success path must go through recorded_attempt, or a refusal
+        would count against the cap again."""
+        import inspect
+        import orchestrator
+        src = inspect.getsource(orchestrator.run_group)
+        assert "recorded_attempt(result, attempt)" in src
+
+    def test_a_refused_run_leaves_the_counter_where_it_was(self, orch):
+        from core.run_outcome import NO_VERDICT, recorded_attempt
+        result = {"skipped": NO_VERDICT, "errors": {"execution_gate": "x"}}
+        summary = orch._cycle_summary(result, "execution",
+                                      recorded_attempt(result, 2), True)
+        assert summary["attempt"] == 1
+
+
+class TestStatusShowsTheOutcome:
+
+    def test_without_a_lookup_nothing_changes_and_nothing_touches_the_database(
+            self, orch, monkeypatch):
+        """The existing overdue tests rely on this: `cycle_status` stays
+        database-free unless asked."""
+        monkeypatch.setattr(orch, "group_state", lambda d, g: "completed")
+        state = orch.cycle_status(now=datetime(2026, 9, 8, 23, 0, tzinfo=ET))
+        assert all(g["outcome"] == "completed" and g["detail"] == ""
+                   for g in state["groups"])
+
+    def test_a_refusal_is_overdue_once_its_hour_has_passed(self, orch, monkeypatch):
+        """`completed` used to hide this on the dashboard banner: the
+        group had 'run', so nothing was late."""
+        from core.run_outcome import CLEAN, REFUSED, GroupOutcome
+        monkeypatch.setattr(orch, "group_state", lambda d, g: "completed")
+        lookup = lambda d, g: GroupOutcome(REFUSED, "x") if g == "execution" else GroupOutcome(CLEAN)
+        state = orch.cycle_status(now=datetime(2026, 9, 8, 11, 0, tzinfo=ET),
+                                  outcome_lookup=lookup)
+        assert {g["key"] for g in state["groups"] if g["overdue"]} == {"execution"}
+
+    def test_a_refusal_is_not_overdue_before_its_hour(self, orch, monkeypatch):
+        from core.run_outcome import REFUSED, GroupOutcome
+        monkeypatch.setattr(orch, "group_state", lambda d, g: "completed")
+        state = orch.cycle_status(now=datetime(2026, 9, 8, 10, 0, tzinfo=ET),
+                                  outcome_lookup=lambda d, g: GroupOutcome(REFUSED, "x"))
+        assert not any(g["overdue"] for g in state["groups"] if g["key"] == "execution")
+
+    def test_a_quiet_day_is_not_overdue(self, orch, monkeypatch):
+        from core.run_outcome import QUIET, GroupOutcome
+        monkeypatch.setattr(orch, "group_state", lambda d, g: "completed")
+        state = orch.cycle_status(
+            now=datetime(2026, 9, 8, 23, 0, tzinfo=ET),
+            outcome_lookup=lambda d, g: GroupOutcome(QUIET, "solomon: no action needed"))
+        assert not state["any_overdue"]
+
+    def test_the_label_names_the_failed_member(self, orch, monkeypatch):
+        from core.run_outcome import PARTIAL, GroupOutcome
+        monkeypatch.setattr(orch, "group_state", lambda d, g: "completed")
+        state = orch.cycle_status(
+            now=datetime(2026, 9, 8, 23, 0, tzinfo=ET),
+            outcome_lookup=lambda d, g: GroupOutcome(PARTIAL, "otis: boom", ("otis",)))
+        close = next(g for g in state["groups"] if g["key"] == "close")
+        assert "otis" in close["outcome"] and close["detail"] == "otis: boom"
+
+    def test_an_unreadable_outcome_shows_the_plain_state(self, orch, monkeypatch):
+        monkeypatch.setattr(orch, "group_state", lambda d, g: "completed")
+        state = orch.cycle_status(now=datetime(2026, 9, 8, 23, 0, tzinfo=ET),
+                                  outcome_lookup=lambda d, g: None)
+        assert all(g["outcome"] == "completed" for g in state["groups"])

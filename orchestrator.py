@@ -109,6 +109,7 @@ from core.cycle_schedule import (
 )
 from core.logging_utils import load_agent_output, log_agent_run, track_agent_run
 from core.market_calendar import is_trading_day
+from core.run_outcome import GroupOutcome, classify_group_row, recorded_attempt
 from core.schema_check import SchemaOutOfDate, require_schema
 from core.trading_control import get_state as get_trading_control_state
 from agents import atlas, vera, solomon, nora, marcus, ada, otis, clara
@@ -437,7 +438,10 @@ def run_group(group: str, today: Optional[date] = None) -> dict:
     log_agent_run(
         today, cycle_row_name(group), 0, "completed",
         started_at=started, completed_at=now_et(),
-        output=_cycle_summary(result, group, attempt, trading_enabled),
+        # `recorded_attempt`: a refusal makes no model call and may
+        # succeed on the next tick, so it must not use up the cap.
+        output=_cycle_summary(result, group, recorded_attempt(result, attempt),
+                              trading_enabled),
         error="; ".join(f"{k}: {v}" for k, v in errors.items()) or None,
     )
     return result
@@ -483,6 +487,36 @@ def group_state(today: date, group: str) -> str:
     return get_run_status(today, cycle_row_name(group)) or "not_run"
 
 
+def group_outcome(today: date, group: str) -> GroupOutcome:
+    """
+    What the group ACTUALLY did today — see core.run_outcome.
+
+    `group_state` stays as it was: it returns the status column, and the
+    execution gate and the attempt counter depend on exactly that. This
+    is a second, derived reading of the same row, for the readers that
+    need to know the difference between a group that did its work and
+    one that merely reached the end.
+    """
+    from core.logging_utils import get_run_record
+    record = get_run_record(today, cycle_row_name(group))
+    if record is None:
+        return classify_group_row(None, None, None)
+    return classify_group_row(record["status"], record["output"], record["error"])
+
+
+def _outcome_or_none(today: date, group: str) -> Optional[GroupOutcome]:
+    """`group_outcome`, except that failing to read it is None, not an
+    exception. It is called from the scheduler's decision path and from
+    the status display, and neither may be taken down by a display
+    helper: an unreadable outcome falls back to the plain reading of the
+    status column, which is what both did before this existed."""
+    try:
+        return group_outcome(today, group)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not read the outcome of %s on %s: %s", group, today, exc)
+        return None
+
+
 def run_auto(now: Optional[datetime] = None) -> dict:
     """
     Decide what, if anything, is due right now, and run it.
@@ -506,9 +540,23 @@ def run_auto(now: Optional[datetime] = None) -> dict:
 
     state = group_state(today, group)
     if state == "completed":
-        logger.info("%s: %s already completed today.", today, group)
-        return {"action": "skipped", "reason": "already completed",
-                "group": group, "date": today}
+        # `completed` means the group reached its end — not that it did
+        # its job. The close group swallows per-agent failures so that
+        # one cannot stop the rest, which is right, and records the run
+        # `completed` regardless; on 22 Oct Otis lost a DNS lookup, the
+        # group said `completed`, and this branch then declined to look
+        # at it again for the rest of the evening. Read the outcome and
+        # retry the two that warrant it. A group that did its work, or
+        # stood down deliberately, is still never run twice.
+        outcome = _outcome_or_none(today, group)
+        if outcome is None or not outcome.retryable:
+            logger.info("%s: %s already completed today.", today, group)
+            return {"action": "skipped", "reason": "already completed",
+                    "group": group, "date": today}
+        logger.warning("%s: %s completed but %s — retrying (%s).",
+                       today, group,
+                       "was refused" if outcome.kind == "refused" else "with errors",
+                       outcome.detail)
 
     if state == "running":
         # A previous tick is still going — the premarket group can take
@@ -536,7 +584,8 @@ def run_auto(now: Optional[datetime] = None) -> dict:
 # =================================================================
 # "DID THE DESK RUN TODAY?" — read by the dashboard
 # =================================================================
-def cycle_status(today: Optional[date] = None, now: Optional[datetime] = None) -> dict:
+def cycle_status(today: Optional[date] = None, now: Optional[datetime] = None,
+                 outcome_lookup: Optional[Callable[[date, str], Optional[GroupOutcome]]] = None) -> dict:
     """
     The state of today's three groups, and whether any of them is
     overdue.
@@ -557,12 +606,21 @@ def cycle_status(today: Optional[date] = None, now: Optional[datetime] = None) -
     for key in GROUP_ORDER:
         spec = PHASE_GROUPS[key]
         state = group_state(today, key) if trading_day else "not_applicable"
-        overdue = bool(trading_day and state in ("not_run", "failed", "running")
-                       and t > spec.due_by)
+        outcome = (outcome_lookup(today, key)
+                   if outcome_lookup and trading_day and state == "completed" else None)
+        # A group that completed WITHOUT doing its job is as late as one
+        # that never started, once its hour has passed: the work it was
+        # for is still not done.
+        overdue = bool(trading_day and t > spec.due_by and (
+            state in ("not_run", "failed", "running")
+            or (outcome is not None and outcome.needs_attention)))
         groups.append({
             "key": key, "label": spec.label, "phases": spec.phases,
             "state": state, "overdue": overdue,
             "due_by": spec.due_by.strftime("%H:%M ET"),
+            "outcome": outcome.label if outcome else state,
+            "outcome_kind": outcome.kind if outcome else state,
+            "detail": outcome.detail if outcome else "",
         })
 
     return {
@@ -651,13 +709,17 @@ def _main(argv: list[str]) -> int:
         return 0
 
     if command == "status":
-        state = cycle_status()
+        state = cycle_status(outcome_lookup=_outcome_or_none)
         print(f"{state['date']} — {state['now_et']}"
               f"{'' if state['trading_day'] else '  (not an NYSE trading day)'}")
         for g in state["groups"]:
             flag = "  OVERDUE" if g["overdue"] else ""
-            print(f"  {g['key']:<10} phases {g['phases']:<4} {g['state']:<12}"
+            print(f"  {g['key']:<10} phases {g['phases']:<4} {g['outcome']:<38}"
                   f" due by {g['due_by']}{flag}")
+            # The reason, on its own line, only where somebody should
+            # act on it — a quiet day needs no explanation.
+            if g["detail"] and g["outcome_kind"] in ("partial", "refused", "failed", "skipped"):
+                print(f"{'':14}{g['detail']}")
         return 1 if state["any_overdue"] else 0
 
     if command == "all":
