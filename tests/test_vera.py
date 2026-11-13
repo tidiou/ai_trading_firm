@@ -111,7 +111,7 @@ def desk(monkeypatch):
         "theses": [],           # SimpleNamespace thesis rows, open
         "calls": [],            # ordered record of what ran
         "monitoring_prompt": None,
-        "screening_prompt": None,
+        "screening_prompts": [],   # one per link, in the order asked
         "orphan_adopts": [],    # tickers the orphan pass will adopt
         "orphan_raises": None,
     }
@@ -149,7 +149,7 @@ def desk(monkeypatch):
                                 "conviction_score": 4, "assumption_checks": []})
             return json.dumps(out)
         state["calls"].append("screening")
-        state["screening_prompt"] = user_prompt
+        state["screening_prompts"].append(user_prompt)
         return "[]"
 
     monkeypatch.setattr(vera, "session_scope", fake_scope)
@@ -170,6 +170,21 @@ def desk(monkeypatch):
 def monitored_from(out):
     """Which tickers actually reached the monitoring loop."""
     return sorted(m["ticker"] for m in out["monitoring"])
+
+
+def screened_tickers(desk):
+    """Every ticker that reached ANY link's screening prompt.
+
+    Reading one prompt is not enough now that screening runs per link:
+    an assertion against the last prompt alone passes for any ticker
+    that happens to live in another link, which is a test that cannot
+    fail for the reason it was written.
+    """
+    names = set()
+    for prompt in desk["screening_prompts"]:
+        tail = prompt.rsplit("removed):", 1)[-1]
+        names.update(t.strip() for t in tail.split(",") if t.strip())
+    return names
 
 
 # =================================================================
@@ -242,7 +257,7 @@ class TestOrphanReviewRunsFirst:
         desk["theses"] = []
         desk["orphan_adopts"] = ["NVDA"]
         vera.run(TODAY, ATLAS)
-        assert "NVDA" not in desk["screening_prompt"]
+        assert "NVDA" not in screened_tickers(desk)
 
 
 class TestAFailedOrphanPassIsContained:
@@ -330,12 +345,11 @@ class TestAPhantomIsNotCleanedUp:
 # =================================================================
 class TestScreeningUniverse:
 
-    def test_a_held_name_is_excluded(self, desk):
-        desk["positions"] = ["AAPL"]
-        desk["theses"] = [thesis(1, "AAPL")]
+    def test_a_held_theme_name_is_excluded_from_every_link(self, desk):
+        desk["positions"] = ["NVDA"]
+        desk["theses"] = [thesis(3, "NVDA")]
         vera.run(TODAY, ATLAS)
-        universe = desk["screening_prompt"].rsplit(":", 1)[1]
-        assert "AAPL" not in universe
+        assert "NVDA" not in screened_tickers(desk)
 
     def test_a_phantom_is_excluded_too_without_being_called_held(self, desk):
         # Not proposing a second thesis for a name that already has one
@@ -344,12 +358,31 @@ class TestScreeningUniverse:
         desk["positions"] = ["AAPL"]
         desk["theses"] = [thesis(1, "AAPL"), thesis(2, "GOOGL")]
         out = vera.run(TODAY, ATLAS)
-        universe = desk["screening_prompt"].rsplit(":", 1)[1]
-        assert "GOOGL" not in universe
+        assert "GOOGL" not in screened_tickers(desk)
         assert out["screening"]["excluded_as_held"] == ["AAPL"]
 
     def test_an_unheld_undocumented_name_is_screened(self, desk):
         desk["positions"] = ["AAPL"]
         desk["theses"] = [thesis(1, "AAPL")]
         vera.run(TODAY, ATLAS)
-        assert "MSFT" in desk["screening_prompt"]
+        assert "MSFT" in screened_tickers(desk)
+
+    def test_the_whole_theme_universe_is_reachable(self, desk):
+        # THE POINT OF THE WIDENING. With nothing held, every one of
+        # the 27 names gets a read — not the six a vendor's sample list
+        # happened to cover.
+        desk["positions"] = []
+        desk["theses"] = []
+        out = vera.run(TODAY, ATLAS)
+        assert screened_tickers(desk) == set(vera.THEME_UNIVERSE)
+        assert out["screening"]["universe_size"] == 27
+
+    def test_a_name_outside_the_theme_is_not_screened(self, desk):
+        # AAPL and JPM were in the old universe and are not in this
+        # chain. Holding AAPL is fine and it is still monitored through
+        # its thesis; it is simply not something this desk researches.
+        desk["positions"] = []
+        desk["theses"] = []
+        vera.run(TODAY, ATLAS)
+        assert "JPM" not in screened_tickers(desk)
+        assert "AAPL" not in screened_tickers(desk)

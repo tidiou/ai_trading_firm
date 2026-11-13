@@ -5,3 +5,5 @@ __pycache__/
 venv/
 .idea/
 *.log
+.DS_Store
+proposed_changes/

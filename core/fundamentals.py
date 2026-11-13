@@ -378,6 +378,83 @@ def fundamentals_for(ticker: str) -> Fundamentals:
     return compute_fundamentals(ticker, load_facts(ticker))
 
 
+def tickers_with_facts(tickers: list[str]) -> set[str]:
+    """Which of these already have anything stored. One query, not one
+    per ticker — this runs at the top of every screening pass and a
+    27-round-trip existence check would be paid every day for an answer
+    that is almost always "all of them"."""
+    if not tickers:
+        return set()
+    wanted = [t.upper() for t in tickers]
+    with session_scope() as session:
+        rows = (session.query(CompanyFact.ticker)
+                .filter(CompanyFact.ticker.in_(wanted))
+                .distinct().all())
+    return {r[0] for r in rows}
+
+
+# The self-heal below fetches eight EDGAR concepts per ticker. Eight
+# requests at the SEC's five-per-second throttle is roughly two
+# seconds, so a cold universe of 27 names is about a minute — too long
+# to sit inside a premarket run that has a window to hit. The cap makes
+# the worst case bounded rather than proportional: a cold start fills
+# in over several sessions instead of holding one hostage, and the
+# intended path is the CLI backfill, with this as the safety net that
+# stops a missing name from being missing forever.
+MAX_BACKFILL_PER_RUN = 6
+
+
+def sync_universe(tickers: list[str], limit: Optional[int] = None) -> dict:
+    """Sync several tickers, containing each one.
+
+    A name EDGAR has nothing for must not stop the rest. That is not
+    hypothetical here: the theme universe contains TSM and ASML, which
+    file 20-F under IFRS rather than 10-K under us-gaap, so the
+    us-gaap concept requests this module makes return nothing for them.
+    They come back with zero facts and no error, which is the honest
+    answer — and the screening pass reads it as "no fundamentals on
+    record" rather than as a failure.
+    """
+    todo = [t.upper() for t in tickers][:limit] if limit else [t.upper() for t in tickers]
+    synced, failed, empty = [], {}, []
+    for ticker in todo:
+        try:
+            result = sync(ticker)
+        except Exception as exc:  # noqa: BLE001
+            failed[ticker] = f"{type(exc).__name__}: {exc}"
+            logger.warning("Fundamentals sync failed for %s: %s", ticker, failed[ticker])
+            continue
+        if result.get("error"):
+            failed[ticker] = result["error"]
+            continue
+        if not result.get("fetched"):
+            empty.append(ticker)
+            continue
+        synced.append(ticker)
+    return {"requested": todo, "synced": synced, "empty": empty, "failed": failed}
+
+
+def backfill_missing(tickers: list[str], limit: int = MAX_BACKFILL_PER_RUN) -> dict:
+    """Sync only the tickers with nothing stored at all, up to `limit`.
+
+    Deliberately NOT a staleness check. Staleness would mean refetching
+    every name on a schedule, and annual figures change when a filing
+    lands — a few times a year — so a daily refresh would spend
+    requests to rediscover what is already stored. Keeping new filings
+    current is the CLI backfill's job, run periodically. This one
+    answers a narrower question: is there anything here at all?
+    """
+    have = tickers_with_facts(tickers)
+    missing = [t for t in (x.upper() for x in tickers) if t not in have]
+    if not missing:
+        return {"requested": [], "synced": [], "empty": [], "failed": {},
+                "missing_total": 0, "deferred": []}
+    result = sync_universe(missing, limit=limit)
+    result["missing_total"] = len(missing)
+    result["deferred"] = missing[limit:]
+    return result
+
+
 # =================================================================
 # CLI
 # =================================================================
@@ -385,7 +462,11 @@ _USAGE = """usage: python -m core.fundamentals <command> [TICKER]
 
   sync TICKER     Fetch the tracked concepts from SEC EDGAR and store
                   them. Safe to re-run; only new facts are inserted.
+  sync-universe   Same, for every name in the theme universe. This is
+                  the backfill, and the periodic refresh that picks up
+                  new filings — run it weekly. Safe to re-run.
   report TICKER   Print the derived annual series from what is stored.
+  coverage        Which theme names have stored facts and which don't.
   tags            List the XBRL concepts this module tracks.
 
 Requires EDGAR_USER_AGENT in .env — the SEC requires automated clients
@@ -401,6 +482,32 @@ def _main(argv: list[str]) -> int:
         for concept, tags in sorted(CONCEPTS.items()):
             print(f"  {concept:<22} {', '.join(tags)}")
         return 0
+
+    if command in ("sync-universe", "coverage"):
+        # Imported here rather than at module scope: core.theme is a
+        # research-universe definition and this module is a data layer.
+        # A top-level import would make every fundamentals consumer
+        # depend on which names the desk happens to research today.
+        from core.theme import THEME_OF, THEME_UNIVERSE
+
+        if command == "coverage":
+            have = tickers_with_facts(THEME_UNIVERSE)
+            for ticker in THEME_UNIVERSE:
+                mark = "ok     " if ticker in have else "MISSING"
+                print(f"  {mark} {ticker:<6} {THEME_OF[ticker]}")
+            print(f"\n{len(have)} of {len(THEME_UNIVERSE)} have stored facts.")
+            return 0 if len(have) == len(THEME_UNIVERSE) else 1
+
+        result = sync_universe(THEME_UNIVERSE)
+        print(f"synced {len(result['synced'])} of {len(result['requested'])}.")
+        if result["empty"]:
+            # Expected for the foreign private issuers — see
+            # sync_universe's docstring. Named rather than counted so a
+            # NEW empty name is visible against the known ones.
+            print(f"  nothing reported under us-gaap: {', '.join(result['empty'])}")
+        for ticker, err in result["failed"].items():
+            print(f"  FAILED {ticker}: {err}", file=sys.stderr)
+        return 1 if result["failed"] else 0
 
     if command in ("sync", "report"):
         if len(argv) < 3:

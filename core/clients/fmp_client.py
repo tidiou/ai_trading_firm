@@ -229,6 +229,27 @@ def get_stock_quote(ticker: str) -> dict:
     return data
 
 
+def get_company_profile(ticker: str) -> dict:
+    """Sector, market cap and description for one ticker.
+
+    THE ONE FMP STOCK ENDPOINT THAT IS NOT SAMPLE-RESTRICTED, which is
+    why it is worth its own accessor. /quote and /key-metrics return
+    402 outside the free tier's fixed sample list; /profile serves any
+    ticker. Vera's screening pass now takes price from Alpaca and
+    fundamentals from EDGAR and comes here for sector alone — and
+    sector is not a nice-to-have, it is the field Nora's
+    max_sector_pct limit is enforced on. A name with no sector is a
+    name the concentration cap cannot see.
+    """
+    data = _get("profile", {"symbol": ticker})
+    if isinstance(data, list):
+        if data:
+            return data[0]
+        coverage.record("profile", ticker, ok=False)
+        return {"error": "no data returned"}
+    return data
+
+
 def get_company_snapshot(ticker: str) -> dict:
     """
     Combines company profile (sector, market cap, description) and

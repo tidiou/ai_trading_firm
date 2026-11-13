@@ -47,6 +47,7 @@ from core.clients.claude_client import run_agent_loop, extract_json
 from core.db import session_scope
 from core.models import (Thesis, PositionMonitoringLog, NewCandidate, Position,
                          RiskPolicyVersion, PositionPnlHistory, ThesisAssumption)
+from core.theme import THEME_LINKS, THEME_UNIVERSE
 from core.thesis import AssumptionCheck, compute_verdict
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ logger = logging.getLogger(__name__)
 VERA_TOOLS = [
     {
         "name": "get_stock_quote",
-        "description": "Current price, daily change, and volume for a single stock.",
+        "description": "Current price and bid-ask spread for a single stock, from the same feed the desk executes against.",
         "input_schema": {
             "type": "object",
             "properties": {"ticker": {"type": "string"}},
@@ -69,7 +70,12 @@ VERA_TOOLS = [
     },
     {
         "name": "get_company_snapshot",
-        "description": "Company profile (sector, market cap, description) and key valuation metrics (P/E, revenue per share, etc.) for a single stock.",
+        "description": (
+            "Sector and market cap, plus the filed annual series for a single "
+            "stock: cash conversion, capex intensity, reinvestment rate, gross "
+            "and operating margin, and diluted share count, each with its "
+            "multi-year trend. Figures come from the company's own SEC filings."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"ticker": {"type": "string"}},
@@ -98,40 +104,230 @@ VERA_TOOLS = [
 # Nora's max_sector_pct limit is enforced on whatever lands here.
 _sector_cache: dict[str, str] = {}
 
+# One FMP /profile response per ticker per run.
+#
+# WHY IT IS NEEDED NOW AND WAS NOT BEFORE. The model decides which
+# tickers to investigate and may call a tool on the same name more
+# than once inside a link's agentic loop. At six names that was
+# irrelevant; across seven links and 27 names the ceiling matters,
+# because FMP's free tier allows 250 requests a day and Atlas spends
+# some of them first. Uncached, a talkative pass can exceed the quota,
+# and an exhausted quota raises out of _get — which would fail every
+# remaining link.
+#
+# A profile is static data (sector, market cap, description), so
+# caching it within a run costs nothing in freshness. Quotes are NOT
+# cached: a price is the one thing here that is supposed to be live.
+# Cleared at the top of run(), so the cache never outlives a session.
+_profile_cache: dict[str, dict] = {}
+
+
+# =================================================================
+# WHERE THE DATA COMES FROM, AND WHY IT MOVED
+#
+# Both tools used to be FMP end to end. That was survivable while the
+# universe was six mega-caps and became the binding constraint the
+# moment it was not: on the free tier, `/quote` and `/key-metrics` are
+# restricted to a fixed sample list and return HTTP 402 for anything
+# outside it. The restriction is NOT size-correlated — it is a list,
+# and the six names in the old universe happened to be on it.
+#
+# scripts/probe_fmp_coverage.py established the split by asking each
+# field of the source that can actually serve it:
+#
+#   sector, market cap   FMP /profile     serves any ticker, unpaywalled
+#   price, spread        Alpaca IEX       every US listing; the same
+#                                         feed Ada sets limit prices
+#                                         from, so a name priced here
+#                                         is a name the desk can trade
+#   annual fundamentals  SEC EDGAR        every filer, free, and the
+#                                         company's own filed figures
+#                                         rather than a vendor's
+#                                         derived multiples
+#
+# WHAT WAS GIVEN UP. FMP's key-metrics carried P/E and price-to-sales.
+# Those are gone: they are a vendor's arithmetic over a price this
+# module can compute for itself, and keeping them would have kept the
+# whole universe hostage to a sample list. What replaces them is
+# better suited to the thesis work anyway — a multi-year margin and
+# cash-conversion trajectory is what a falsifiable assumption gets
+# written against, and a trailing P/E is not.
+#
+# COVERAGE IS RECORDED FOR ALL THREE. The tracker lives in fmp_client
+# and now counts outcomes that have nothing to do with FMP, which is a
+# misleading home for it — noted as a rename worth doing. What matters
+# is that Solomon's data_coverage gate keeps meaning "how much of what
+# she asked for did she get", and that is only true if the two new
+# sources report into the same count.
+# =================================================================
+def _quote(ticker: str) -> dict:
+    """Price and spread from Alpaca, recorded as coverage either way."""
+    from core.clients import alpaca_client
+
+    try:
+        quote = alpaca_client.get_latest_quote(ticker)
+    except Exception as exc:  # noqa: BLE001
+        fmp_client.coverage.record("alpaca-quote", ticker, ok=False)
+        return {"error": f"no quote available: {type(exc).__name__}: {exc}"}
+    fmp_client.coverage.record("alpaca-quote", ticker, ok=quote.get("mid") is not None)
+    return quote
+
+
+def _fundamentals(ticker: str) -> dict:
+    """The filed annual series, from what the sync has stored.
+
+    Returns the rendered description rather than the raw ratio tables.
+    The description names the fiscal years it covers and says
+    "inputs not reported" where a ratio could not be computed, so the
+    model cannot mistake an absent figure for a zero — which is the
+    specific way a valuation screen goes quietly wrong.
+    """
+    from core.fundamentals import fundamentals_for
+
+    try:
+        derived = fundamentals_for(ticker)
+    except Exception as exc:  # noqa: BLE001
+        fmp_client.coverage.record("edgar-fundamentals", ticker, ok=False)
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+    # ok WHENEVER THE LOOKUP ANSWERED, INCLUDING WHEN THE ANSWER IS
+    # "NOTHING ON RECORD". Recording an absence as a failure was tried
+    # and is wrong twice over:
+    #
+    #   It would refuse every trade for the first days after this
+    #   shipped. Solomon's coverage_gate stands down risk-increasing
+    #   proposals below MIN_DATA_COVERAGE_PCT (60). The backfill fills
+    #   six names a session by design, so a cold universe would report
+    #   22% on day one and 44% on day two — Vera screening 27 names,
+    #   surfacing candidates, and Solomon rejecting all of them for a
+    #   data problem that is really a rate limit the desk chose.
+    #
+    #   And it would never clear for a foreign private issuer. A 20-F
+    #   filer reports nothing under the us-gaap concepts this desk
+    #   tracks, permanently. That is a fact about the filer, not a
+    #   failed request, and parking it in degraded_tickers forever
+    #   would train the operator to ignore that field.
+    #
+    # Coverage answers "did the request I made come back". Whether the
+    # answer was rich enough to build a thesis on is a different
+    # question, and it is reported in `fundamentals_backfill` and
+    # visible to the model in this very tool result.
+    fmp_client.coverage.record("edgar-fundamentals", ticker, ok=True)
+    if not derived.measurable:
+        # An honest absence, and a common one: a foreign private issuer
+        # files 20-F under IFRS and reports nothing under the us-gaap
+        # concepts this desk tracks. Saying so beats an empty dict.
+        return {"available": False, "reason": derived.unavailable,
+                "summary": derived.describe()}
+    return {
+        "available": True,
+        "summary": derived.describe(),
+        "fiscal_years": derived.years,
+        "trends_pp": {name: derived.trend(name) for name in
+                      ("cash_conversion", "capex_intensity", "reinvestment_rate",
+                       "gross_margin", "operating_margin")},
+        "diluted_share_change_pct": derived.share_count_change_pct,
+    }
+
 
 def execute_tool(tool_name: str, tool_input: dict):
     if tool_name == "get_stock_quote":
-        return fmp_client.get_stock_quote(tool_input["ticker"])
+        return _quote(tool_input["ticker"])
     if tool_name == "get_company_snapshot":
         ticker = tool_input["ticker"]
-        snapshot = fmp_client.get_company_snapshot(ticker)
-        profile = snapshot.get("profile") if isinstance(snapshot, dict) else None
+        # FMP profile survives, for the one thing it is still the best
+        # source of — and the one thing a risk limit depends on.
+        if ticker in _profile_cache:
+            profile = _profile_cache[ticker]
+        else:
+            profile = fmp_client.get_company_profile(ticker)
+            # A paywalled or empty response is cached too, deliberately:
+            # retrying it inside the same run spends quota to be told
+            # the same thing, and quota is the constraint this cache
+            # exists for.
+            _profile_cache[ticker] = profile
         if isinstance(profile, dict):
             sector = profile.get("sector")
             if isinstance(sector, str) and sector.strip():
                 _sector_cache[ticker] = sector.strip()
-        return snapshot
+        return {"profile": profile, "fundamentals": _fundamentals(ticker)}
     raise ValueError(f"Vera has no tool named '{tool_name}'")
 
 
 # =================================================================
-# FIXED UNIVERSE — deterministic, not LLM-chosen (Operating Manual
+# THE UNIVERSE — deterministic, not LLM-chosen (Operating Manual
 # §7.2: the universe is pre-filtered by CODE before any LLM reasoning
-# happens). Starting list: well-known, highly liquid US large-caps,
-# chosen to maximize the odds of being covered under FMP's free-tier
-# sample-symbol restriction. If a ticker 402s at request time,
-# get_company_snapshot() degrades gracefully rather than crashing —
-# see fmp_client._get(). Revisit/expand this list once on a paid
-# FMP tier with full-universe access.
+# happens).
+#
+# It used to be six US mega-caps: AAPL, MSFT, GOOGL, AMZN, NVDA, JPM.
+# That list was not a strategy. It was chosen to survive FMP's
+# free-tier sample restriction, and it quietly made a data vendor's
+# sample list the desk's research mandate. On 2026-09-23 it had
+# shrunk to a three-name screen once holdings were excluded, which is
+# not a screen.
+#
+# It is now the AI data-centre value chain from core/theme.py — 27
+# names across 7 causally chained links. The theme module owns which
+# names those are and why; this module owns what to do with them.
+#
+# SCREENED PER LINK, BOTTLENECK-FIRST. Three reasons, in order of
+# how much they matter:
+#
+#   1. THE QUESTION IS DIFFERENT PER LINK. What makes a power name
+#      interesting — a contracted interconnection backlog converting
+#      on schedule — has nothing to do with what makes a compute name
+#      interesting. One undifferentiated pass over 27 tickers asks
+#      one question of seven different businesses. Each link's own
+#      `depends_on` and `note` go into its prompt, so the screen asks
+#      the question that link actually turns on.
+#
+#   2. ONE FAILED LINK COSTS ONE LINK. A single pass over 27 names is
+#      one response that either arrives or does not.
+#
+#   3. TOKENS. 27 full entries do not fit one 4000-token response,
+#      and a truncated JSON array is a failed pass.
+#
+# THE ORDER IS THE STRATEGY, written down. Power first because power
+# is the binding constraint today; hyperscalers last because they are
+# the payers, and their capex is everyone else's revenue. Reading the
+# chain from the constraint toward the payer is the house view, and a
+# later pass sees what the earlier ones surfaced.
 # =================================================================
-# Starting list: well-known, highly liquid US large-caps, chosen to
-# maximize the odds of being covered under FMP's free-tier
-# sample-symbol restriction. Deliberately trimmed from an earlier,
-# larger list — each ticker costs 2 FMP calls per screening pass, and
-# heavy iterative testing kept exhausting the free tier's daily
-# quota. Expand this once on a paid FMP tier, or for a deliberate,
-# infrequent "real" run rather than routine testing.
-FIXED_UNIVERSE = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "JPM"]
+SCREENING_ORDER: list[str] = [
+    "power",
+    "cooling_infra",
+    "foundry_equipment",
+    "memory",
+    "networking",
+    "compute",
+    "hyperscaler",
+]
+
+FIXED_UNIVERSE = THEME_UNIVERSE
+
+
+def screening_order() -> list[str]:
+    """SCREENING_ORDER, plus any link theme.py has that it doesn't.
+
+    A LINK ADDED TO theme.py AND NOT TO THE ORDER ABOVE IS STILL
+    SCREENED — at the end, with a warning. The alternative considered
+    was an assert at import, and it was rejected: a link missing from
+    this list is a coverage gap in one link, while a failed import of
+    agents/vera.py is the whole desk down for the day. Taking the
+    worse outcome to punish the smaller mistake is not a trade worth
+    making, and the warning still makes the omission visible.
+
+    A link in the order that theme.py no longer has is dropped
+    silently — there is nothing to screen and nothing to warn about.
+    """
+    known = [link for link in SCREENING_ORDER if link in THEME_LINKS]
+    extra = [link for link in THEME_LINKS if link not in SCREENING_ORDER]
+    if extra:
+        logger.warning(
+            "core.theme defines link(s) not in SCREENING_ORDER: %s. They will "
+            "be screened LAST rather than in their place in the chain — add "
+            "them to SCREENING_ORDER in agents/vera.py.", ", ".join(extra))
+    return known + extra
 
 # The conviction at or above which a screened name is SURFACED as a
 # new_candidates row. Below it the name is counted in the screening
@@ -381,6 +577,22 @@ This is your SCREENING pass. You are looking for NEW investment
 candidates from a fixed list of tickers, for a discretionary,
 weeks-to-months holding horizon.
 
+THE FIRM'S MANDATE. This desk researches one thing: the AI
+data-centre value chain, read from its bottleneck outward. The
+question is not "is this a good company" but "what does this link of
+the chain depend on, and is that dependency holding". You are given
+ONE LINK at a time, with what that link turns on. Screen against
+THAT, not against a generic quality checklist.
+
+A STRUCTURAL THESIS IS NOT A CATALYST-DRIVEN ONE. Much of this chain
+runs on contracted, multi-year commitments — turbine slots booked
+into the 2030s, interconnection queues measured in years, backlog
+that converts on a schedule. Backlog converting on schedule IS a
+named catalyst when you can point to the conversion; "the AI theme
+is strong" is not. Do not inflate a score because the theme is
+exciting, and do not deflate one to a 3 because the catalyst is a
+signed commitment rather than an event on a calendar.
+
 Rules:
 - Only investigate tickers from the list you're given — this is a
   pre-filtered universe, not an invitation to consider anything else.
@@ -454,6 +666,75 @@ TICKER you were given:
 # resist. So every field below is derived in code from the scores she
 # returned. There is no narrative field, and that is deliberate.
 # =================================================================
+def link_batches(excluded: list[str] | set[str] | None = None,
+                 order: list[str] | None = None) -> list[tuple[str, list[str]]]:
+    """The screening plan: (link, tickers) in bottleneck-first order,
+    with held and already-thesised names removed and empty links
+    dropped.
+
+    Pure, so the plan can be asserted without a model or a database —
+    which is the point of having it as a function rather than a loop
+    body. The order it returns is the house view written down; a test
+    that pins it is a test that pins the strategy.
+    """
+    excluded = set(excluded or ())
+    # A name listed under two links is screened under the FIRST, which
+    # is the same rule THEME_OF applies when it assigns a name to a
+    # link for risk aggregation. theme.py's own comment flags AVGO as
+    # arguably both compute and networking, so this is one edit away
+    # from mattering: without it the name would be screened twice and
+    # universe_size would over-count against a THEME_UNIVERSE that
+    # de-duplicates.
+    seen: set[str] = set()
+    batches = []
+    for link in (order or screening_order()):
+        tickers = [t for t in THEME_LINKS[link]["tickers"]
+                   if t not in excluded and t not in seen]
+        seen.update(tickers)
+        if tickers:
+            batches.append((link, tickers))
+    return batches
+
+
+def describe_link(link: str) -> str:
+    """The question this link turns on, for its screening prompt. Comes
+    from core/theme.py rather than being restated here — one definition
+    of the chain, used by the screen, by Atlas's read-across and by
+    risk aggregation."""
+    spec = THEME_LINKS[link]
+    return (f"LINK: {spec['label']}\n"
+            f"This link depends on: {spec['depends_on']}.\n"
+            f"What to keep in mind: {spec['note']}")
+
+
+def screen_link(link: str, tickers: list[str], today: date,
+                atlas_output: dict) -> list[NewCandidateOutput]:
+    """One link's screening pass. Raises on failure — containment is
+    the caller's job, because the caller is the one that knows a lost
+    link is survivable and a lost day is not."""
+    prompt = (
+        f"Today's date: {today}.\n"
+        f"Macro backdrop from Atlas: regime={atlas_output.get('regime_signal')}, "
+        f"confidence={atlas_output.get('confidence')}, "
+        f"narrative: {atlas_output.get('narrative')}\n\n"
+        f"{describe_link(link)}\n\n"
+        f"Tickers to screen (names already held or already carrying an open "
+        f"thesis have been removed): {', '.join(tickers)}"
+    )
+    raw = run_agent_loop(
+        system_prompt=SCREENING_SYSTEM_PROMPT,
+        user_prompt=prompt,
+        tools=VERA_TOOLS,
+        tool_executor=execute_tool,
+        # Sized for a link, not a universe: the largest links hold five
+        # names, and a 4-5 entry carries a full thesis, risks and
+        # valuation note. The old single pass had the same budget for
+        # up to 27.
+        max_tokens=4000,
+    )
+    return [NewCandidateOutput.model_validate(item) for item in extract_json(raw)]
+
+
 def partition_screened(
     screened: list[NewCandidateOutput],
     threshold: int = SURFACING_THRESHOLD,
@@ -526,6 +807,13 @@ def screening_summary(
 def describe_screening(summary: dict) -> str:
     """One line for the daily report and the dashboard. Reads the
     computed summary only — it never reaches for the model."""
+    if summary["universe_size"] == 0:
+        # Distinct from the line below on purpose. "Nothing came back"
+        # is a failed pass; "there was nothing left to ask about" is a
+        # fully-invested book, and reporting the second as the first
+        # would send someone looking for an outage that isn't one.
+        return ("Nothing left to screen — every name in the universe is "
+                "either held or already carries an open thesis.")
     if summary["screened_count"] == 0:
         return ("Screening returned nothing at all — not "
                 "'no ideas', but no read on any name. Treat as a failed pass.")
@@ -949,6 +1237,47 @@ def run(today: date, atlas_output: dict) -> dict:
     # index calls would be pooled into her ticker coverage and dilute
     # the number Solomon gates on.
     fmp_client.coverage.reset()
+    _profile_cache.clear()
+
+    # -------------------------------------------------------------
+    # The valuation half of get_company_snapshot reads filed figures
+    # out of company_facts, so a name with nothing stored gets screened
+    # on price and sector alone. This fills the gaps — bounded, so a
+    # cold universe costs several sessions rather than one long one,
+    # and contained, because a screen on partial data beats no screen.
+    #
+    # NOT the refresh mechanism. New filings are picked up by
+    # `python -m core.fundamentals sync-universe`, run periodically.
+    # This only answers "is there anything here at all".
+    # -------------------------------------------------------------
+    fundamentals_backfill: dict = {}
+    try:
+        from core.fundamentals import backfill_missing
+
+        fundamentals_backfill = backfill_missing(FIXED_UNIVERSE)
+        if fundamentals_backfill.get("missing_total"):
+            # The empty names are called out separately because they
+            # are NOT a backlog. A filer reporting nothing under the
+            # us-gaap concepts this desk tracks will report nothing
+            # tomorrow either, so it stays in `missing` forever — and
+            # a daily warning telling the operator to run a command
+            # that cannot fix it is a warning that trains them to stop
+            # reading warnings.
+            empty = fundamentals_backfill.get("empty") or []
+            logger.warning(
+                "Fundamentals missing for %s theme name(s); synced %s this run, "
+                "%s deferred to a later session.%s Run `python -m "
+                "core.fundamentals sync-universe` to fill the rest at once.",
+                fundamentals_backfill["missing_total"],
+                len(fundamentals_backfill["synced"]),
+                len(fundamentals_backfill["deferred"]),
+                (f" {', '.join(empty)} reported nothing under us-gaap and will "
+                 f"not fill — expected for a foreign private issuer filing "
+                 f"20-F under IFRS." if empty else ""))
+    except Exception as exc:  # noqa: BLE001
+        fundamentals_backfill = {"error": f"{type(exc).__name__}: {exc}"}
+        logger.warning("Fundamentals backfill failed (%s). Screening continues "
+                       "on whatever is already stored.", exc)
 
     # Populated by the monitoring pass; empty on a day with nothing held.
     authored_assumptions: dict = {}
@@ -1079,27 +1408,25 @@ def run(today: date, atlas_output: dict) -> dict:
     # -------------------------------------------------------------
     # JOB 2: SCREENING — [4] second agentic loop
     # -------------------------------------------------------------
-    screening_universe = [t for t in FIXED_UNIVERSE
-                          if t not in excluded_from_screening]
-    screening_prompt = (
-        f"Today's date: {today}.\n"
-        f"Macro backdrop from Atlas: regime={atlas_output.get('regime_signal')}, "
-        f"confidence={atlas_output.get('confidence')}, "
-        f"narrative: {atlas_output.get('narrative')}\n"
-        f"Universe to screen (already-held tickers excluded): {', '.join(screening_universe)}"
-    )
+    batches = link_batches(excluded_from_screening)
+    screening_universe = [t for _, tickers in batches for t in tickers]
 
-    screening_raw = run_agent_loop(
-        system_prompt=SCREENING_SYSTEM_PROMPT,
-        user_prompt=screening_prompt,
-        tools=VERA_TOOLS,
-        tool_executor=execute_tool,
-        max_tokens=4000,  # up to 16 tickers screened, each candidate needs a full thesis/risks/valuation
-    )
-    screened_results = [
-        NewCandidateOutput.model_validate(item)
-        for item in extract_json(screening_raw)
-    ]
+    screened_results: list[NewCandidateOutput] = []
+    link_failures: dict[str, str] = {}
+    for link, tickers in batches:
+        try:
+            screened_results.extend(screen_link(link, tickers, today, atlas_output))
+        except Exception as exc:  # noqa: BLE001
+            # CONTAINED ON PURPOSE. Seven passes instead of one is only
+            # an improvement if a failed pass costs a link rather than
+            # the day. The names in a failed link then show up in the
+            # summary's `not_returned` — the field that already exists
+            # for exactly this, "asked for a read and did not get one"
+            # — so nothing goes missing silently.
+            link_failures[link] = f"{type(exc).__name__}: {exc}"
+            logger.warning("Screening failed for link %s (%s): %s. "
+                           "The other links continue.",
+                           link, ", ".join(tickers), link_failures[link])
 
     # The surfacing decision, in code. `candidate_results` keeps its
     # old meaning — the names that become new_candidates rows and that
@@ -1118,6 +1445,12 @@ def run(today: date, atlas_output: dict) -> dict:
     # two things: no consumer needs to import a formatter from an agent
     # module just to display a line, and the ledger keeps what was
     # actually said on the day even if the wording is changed later.
+    # Which links were actually asked, and which fell over. A link that
+    # failed leaves its names in `not_returned`, but only this says
+    # WHY they are not there — a distinction that matters when
+    # `best_conviction` is read as a trend over weeks.
+    screening["links_screened"] = [link for link, _ in batches]
+    screening["link_failures"] = link_failures
     screening["statement"] = describe_screening(screening)
     logger.info("Vera screening — %s", screening["statement"])
     if held_back:
@@ -1210,12 +1543,30 @@ def run(today: date, atlas_output: dict) -> dict:
                             synchronize_session=False)
                 )
 
-        # Delete today's prior candidates before reinserting — a
-        # same-day rerun should REPLACE today's screening results,
-        # not accumulate tickers across multiple runs (the earlier
-        # per-row upsert let stale candidates from an earlier run
-        # linger even if a later rerun didn't surface them again).
-        session.query(NewCandidate).filter(NewCandidate.candidate_date == today).delete()
+        # A same-day rerun should REPLACE today's screening results
+        # rather than accumulate tickers across runs (the earlier
+        # per-row upsert let a stale candidate linger even if a later
+        # rerun didn't surface it again).
+        #
+        # SCOPED TO THE NAMES THIS RUN ACTUALLY GOT A READ ON, which
+        # this file learned the hard way. It used to delete every row
+        # for today unconditionally, and that was safe only because a
+        # screening failure RAISED out of run() before reaching here.
+        # Per-link screening contains those failures, so a pass in
+        # which every link failed would now arrive with an empty
+        # candidate list and quietly delete a successful earlier run's
+        # work. Deleting only what was re-screened makes the blast
+        # radius the same as the read: a failed link's rows survive,
+        # an untouched name's row survives, and a name screened today
+        # that fell below the bar loses its row exactly as intended.
+        screened_today = {c.ticker for c in screened_results}
+        if screened_today:
+            (
+                session.query(NewCandidate)
+                .filter(NewCandidate.candidate_date == today,
+                        NewCandidate.ticker.in_(screened_today))
+                .delete(synchronize_session=False)
+            )
         for c in candidate_results:
             stmt = pg_insert(NewCandidate).values(
                 candidate_date=today,
@@ -1300,6 +1651,9 @@ def run(today: date, atlas_output: dict) -> dict:
             "reconciled": book.is_reconciled,
             "statement": book.describe(),
         },
+        # What the bounded self-heal did, if anything. Empty dict on
+        # the ordinary day where every theme name already has facts.
+        "fundamentals_backfill": fundamentals_backfill,
         "data_coverage": data_coverage,
         # What the screening pass did, including on the days it did
         # nothing. Rides in the return dict rather than a new table:
