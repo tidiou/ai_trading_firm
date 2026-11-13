@@ -1,0 +1,17 @@
+# Secrets never enter the image — Railway injects them as variables.
+.env
+.env.*
+!.env.example
+
+.git
+.venv
+.venv1
+venv
+.idea
+.pytest_cache
+__pycache__
+*.pyc
+.DS_Store
+logs
+tests
+proposed_changes

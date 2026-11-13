@@ -1,0 +1,17 @@
+# Versions installed in the working .venv on 13 Nov 2026 — the ones the
+# desk has actually run with. Used by the Dockerfile as `pip -c`.
+# To upgrade: change a line here on purpose, never by accident.
+anthropic==1.5.0
+alpaca-py==0.44.0
+requests==2.34.2
+sqlalchemy==2.0.52
+psycopg2-binary==2.9.13
+python-dotenv==1.2.3
+pydantic==2.13.5
+pydantic-core==2.46.5
+pandas-market-calendars==5.4.0
+exchange-calendars==4.13.2
+apscheduler==3.11.3
+streamlit==1.63.0
+pandas==2.3.3
+numpy==2.2.6

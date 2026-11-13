@@ -1,0 +1,14 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "startCommand": "streamlit run dashboard/app.py --server.port 8080 --server.address :: --server.headless true --client.toolbarMode viewer --browser.gatherUsageStats false",
+    "healthcheckPath": "/_stcore/health",
+    "healthcheckTimeout": 120,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
+  }
+}
